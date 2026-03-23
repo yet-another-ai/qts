@@ -155,6 +155,7 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
     } else if target.contains("windows") && target.contains("msvc") {
         // C++ runtime linked via ggml's MSVC build flags.
+        println!("cargo:rustc-link-lib=advapi32");
     } else {
         println!("cargo:rustc-link-lib=stdc++");
     }
