@@ -63,6 +63,7 @@ cargo build -p ggml-sys
 | `metal` | Enables Metal in GGML. Runtime: with `QWEN3_TTS_BACKEND=auto` (default), Apple builds prefer Metal then CPU; set `QWEN3_TTS_BACKEND=metal` to require Metal. |
 | `vulkan` | Enables Vulkan in GGML on all targets. Runtime: `auto` uses Vulkan only on **non-Apple** (then CPU fallback). On **Apple**, set **`QWEN3_TTS_BACKEND=vulkan`** to select Vulkan (MoltenVK); otherwise `auto` will not pick Vulkan. |
 | `coreml` | Enables the ONNX Runtime CoreML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers CoreML on Apple platforms, otherwise CPU. |
+| `directml` | Enables the ONNX Runtime DirectML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers DirectML on Windows builds with this feature, otherwise CPU. |
 | `native` | Enable host-CPU-specific ggml kernels for less portable but faster CPU binaries. |
 
 ## Vulkan prerequisites

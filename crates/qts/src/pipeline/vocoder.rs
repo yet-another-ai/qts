@@ -5,7 +5,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(feature = "coreml")]
+#[cfg(any(feature = "coreml", feature = "directml"))]
 use ort::ep::ExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
@@ -40,6 +40,8 @@ pub enum VocoderExecutionProvider {
     Cpu,
     #[cfg(feature = "coreml")]
     CoreMl,
+    #[cfg(feature = "directml")]
+    DirectMl,
 }
 
 impl VocoderExecutionProvider {
@@ -49,6 +51,8 @@ impl VocoderExecutionProvider {
             Self::Cpu => "cpu",
             #[cfg(feature = "coreml")]
             Self::CoreMl => "coreml",
+            #[cfg(feature = "directml")]
+            Self::DirectMl => "directml",
         }
     }
 
@@ -58,6 +62,8 @@ impl VocoderExecutionProvider {
             Self::Cpu => "ORT/CPU",
             #[cfg(feature = "coreml")]
             Self::CoreMl => "ORT/CoreML",
+            #[cfg(feature = "directml")]
+            Self::DirectMl => "ORT/DirectML",
         }
     }
 }
@@ -87,8 +93,23 @@ fn parse_requested_execution_provider() -> Result<RequestedExecutionProvider, Qw
                 ))
             }
         }
+        "directml" => {
+            #[cfg(feature = "directml")]
+            {
+                Ok(RequestedExecutionProvider::Explicit(
+                    VocoderExecutionProvider::DirectMl,
+                ))
+            }
+            #[cfg(not(feature = "directml"))]
+            {
+                Err(Qwen3TtsError::InvalidInput(
+                    "unsupported QWEN3_TTS_VOCODER_EP=directml; binary was built without the directml feature"
+                        .into(),
+                ))
+            }
+        }
         other => Err(Qwen3TtsError::InvalidInput(format!(
-            "unsupported QWEN3_TTS_VOCODER_EP={other}; expected auto, cpu, or coreml"
+            "unsupported QWEN3_TTS_VOCODER_EP={other}; expected auto, cpu, coreml, or directml"
         ))),
     }
 }
@@ -110,7 +131,24 @@ fn default_auto_execution_provider_order() -> Vec<VocoderExecutionProvider> {
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        vec![VocoderExecutionProvider::Cpu]
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(feature = "directml")]
+            {
+                vec![
+                    VocoderExecutionProvider::DirectMl,
+                    VocoderExecutionProvider::Cpu,
+                ]
+            }
+            #[cfg(not(feature = "directml"))]
+            {
+                vec![VocoderExecutionProvider::Cpu]
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            vec![VocoderExecutionProvider::Cpu]
+        }
     }
 }
 
@@ -140,9 +178,22 @@ fn parse_auto_execution_provider_order() -> Result<Vec<VocoderExecutionProvider>
                     ));
                 }
             }
+            "directml" => {
+                #[cfg(feature = "directml")]
+                {
+                    VocoderExecutionProvider::DirectMl
+                }
+                #[cfg(not(feature = "directml"))]
+                {
+                    return Err(Qwen3TtsError::InvalidInput(
+                        "QWEN3_TTS_VOCODER_EP_FALLBACK includes directml, but the binary was built without the directml feature"
+                            .into(),
+                    ));
+                }
+            }
             other => {
                 return Err(Qwen3TtsError::InvalidInput(format!(
-                    "QWEN3_TTS_VOCODER_EP_FALLBACK: unknown EP '{other}' (expected cpu or coreml)"
+                    "QWEN3_TTS_VOCODER_EP_FALLBACK: unknown EP '{other}' (expected cpu, coreml, or directml)"
                 )));
             }
         };
@@ -388,6 +439,8 @@ impl Vocoder {
             VocoderExecutionProvider::Cpu => Ok(()),
             #[cfg(feature = "coreml")]
             VocoderExecutionProvider::CoreMl => Self::register_coreml(builder, required),
+            #[cfg(feature = "directml")]
+            VocoderExecutionProvider::DirectMl => Self::register_directml(builder, required),
         }
     }
 
@@ -431,6 +484,50 @@ impl Vocoder {
     ) -> Result<(), Qwen3TtsError> {
         Err(Qwen3TtsError::InvalidInput(
             "coreml EP is unavailable because the binary was built without the coreml feature"
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "directml")]
+    fn register_directml(
+        builder: &mut ort::session::builder::SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        let directml = ort::ep::DirectML::default();
+        if !directml.supported_by_platform() {
+            if required {
+                return Err(Qwen3TtsError::InvalidInput(
+                    "QWEN3_TTS_VOCODER_EP=directml is only supported on Windows".into(),
+                ));
+            }
+            return Err(Qwen3TtsError::InvalidInput(
+                "directml EP is not supported on this platform".into(),
+            ));
+        }
+        if !directml.is_available().map_err(ort_err)? {
+            if required {
+                return Err(Qwen3TtsError::InvalidInput(
+                    "QWEN3_TTS_VOCODER_EP=directml requested, but this build of ONNX Runtime does not include DirectML".into(),
+                ));
+            }
+            return Err(Qwen3TtsError::InvalidInput(
+                "directml EP is not available in this ONNX Runtime build".into(),
+            ));
+        }
+        match directml.register(builder) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(ort_err(err)),
+        }
+    }
+
+    #[cfg(not(feature = "directml"))]
+    #[allow(dead_code)]
+    fn register_directml(
+        _builder: &mut ort::session::builder::SessionBuilder,
+        _required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Err(Qwen3TtsError::InvalidInput(
+            "directml EP is unavailable because the binary was built without the directml feature"
                 .into(),
         ))
     }

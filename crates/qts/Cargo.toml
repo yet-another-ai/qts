@@ -14,6 +14,7 @@ vulkan = ["qts_ggml/vulkan"]
 blas = ["qts_ggml/blas"]
 native = ["qts_ggml/native"]
 coreml = ["ort/coreml"]
+directml = ["ort/directml"]
 
 [dependencies]
 qts_ggml.workspace = true

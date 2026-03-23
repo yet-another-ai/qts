@@ -34,7 +34,7 @@ jobs:
           - os: macos-latest
             feature_set: metal,coreml,blas
           - os: windows-latest
-            feature_set: vulkan
+            feature_set: vulkan,directml
     steps:
       - uses: actions/checkout@v6
         with:

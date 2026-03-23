@@ -51,6 +51,7 @@ CLI builds the same engine as the library and supports the same backend features
 cargo build -p qts_cli
 cargo build -p qts_cli --features metal
 cargo build -p qts_cli --features vulkan
+cargo build -p qts_cli --features directml
 ```
 
 GPU / accelerator backends are Cargo features on `qts_ggml_sys` (see [VERSIONS.md](VERSIONS.md)).
@@ -99,7 +100,7 @@ tracking for `*.gguf` / `*.onnx`, run `cargo xtask hf-release --model Qwen/qts-1
 
 Official Hugging Face publication is handled by GitHub Actions:
 
-- `.github/workflows/build.yml` builds accelerated `qts_cli` archives for Linux, macOS, and Windows on pull requests and `main` (Vulkan on Linux/Windows; `metal+coreml+blas` on macOS via Accelerate), and uploads tagged `v*` builds to GitHub Releases
+- `.github/workflows/build.yml` builds accelerated `qts_cli` archives for Linux, macOS, and Windows on pull requests and `main` (Vulkan on Linux, `metal+coreml+blas` on macOS via Accelerate, and `vulkan+directml` on Windows), and uploads tagged `v*` builds to GitHub Releases
 - `.github/workflows/hf-release.yml` publishes tagged `v*` releases to `dsh0416/qts-12Hz-0.6B-Base-QTS`
 - `.github/workflows/model-integration.yml` provides a manual release-preview run that exports and uploads the staged bundle without pushing
 - repository secret `HF_TOKEN` must be configured with write access to the Hugging Face model repository
@@ -197,7 +198,7 @@ Notes:
 - Press `Enter` to synthesize the current line.
 - Press `F2` to cycle the synthesis language between English, Chinese, and Japanese.
 - Press `Esc`, `Ctrl-C`, or type `:q` to quit.
-- The TUI header shows both the transformer backend (`qts_ggml`) and the active vocoder EP (`ORT/CPU` or `ORT/CoreML`).
+- The TUI header shows both the transformer backend (`qts_ggml`) and the active vocoder EP (`ORT/CPU`, `ORT/CoreML`, or `ORT/DirectML`).
 - `--backend` and `--vocoder-ep` let you choose the transformer backend and vocoder EP directly from the command line.
 - `--backend-fallback` and `--vocoder-ep-fallback` accept comma-separated fallback chains used when the corresponding selector is `auto`.
 - `--language en|zh|ja` is the friendly startup flag; `--language-id` still works if you want to pass a raw codec language id.
@@ -215,11 +216,23 @@ cargo run -p qts_cli -- tui \
   --chunk-size 4
 ```
 
+On Windows, the ONNX vocoder can use DirectML:
+
+```bash
+cargo run -p qts_cli --no-default-features --features vulkan,directml -- tui \
+  --model-dir models/qts-f16-onnx \
+  --backend auto \
+  --backend-fallback vulkan,cpu \
+  --vocoder-ep directml \
+  --chunk-size 4
+```
+
 Defaults:
 
 - Apple transformer `auto`: `metal,vulkan,cpu`
 - Other transformer `auto`: `vulkan,cpu`
 - Apple vocoder `auto`: `coreml,cpu`
+- Windows vocoder `auto`: `directml,cpu`
 - Other vocoder `auto`: `cpu`
 
 ## Tests
@@ -256,7 +269,7 @@ This runs `qts_cli profile`, which prints per-stage milliseconds and percentage 
 
 GGML picks GPU devices by **registry** name plus index: use **`QWEN3_TTS_GPU_DEVICE`** (default `0`) to choose among multiple Vulkan or Metal adapters (`Vulkan0` / `MTL0`, …).
 
-**Vocoder EP selection:** use `--vocoder-ep` / `--vocoder-ep-fallback` on the CLI, or `QWEN3_TTS_VOCODER_EP` / `QWEN3_TTS_VOCODER_EP_FALLBACK` from the environment. The default `auto` chain is `coreml,cpu` on Apple and `cpu` elsewhere.
+**Vocoder EP selection:** use `--vocoder-ep` / `--vocoder-ep-fallback` on the CLI, or `QWEN3_TTS_VOCODER_EP` / `QWEN3_TTS_VOCODER_EP_FALLBACK` from the environment. The default `auto` chain is `coreml,cpu` on Apple, `directml,cpu` on Windows builds with the `directml` feature, and `cpu` elsewhere.
 
 ## License
 

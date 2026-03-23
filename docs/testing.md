@@ -25,6 +25,9 @@ cargo check -p qwen3-tts --no-default-features --features metal
 # Linux / Windows with Vulkan SDK + glslc available
 cargo check -p qwen3-tts --no-default-features --features vulkan
 
+# Windows DirectML vocoder path
+cargo check -p qwen3-tts-cli --no-default-features --features directml
+
 # CLI crate (same feature flags pass through to qwen3-tts)
 cargo check -p qwen3-tts-cli
 ```
@@ -51,7 +54,7 @@ The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machin
 
 Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). `cargo xtask profile vulkan` sets `QWEN3_TTS_BACKEND=vulkan` so macOS can use MoltenVK when the binary is built with `--features vulkan`.
 
-The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`** (`auto`, `cpu`, `coreml`). On Apple platforms, `auto` prefers CoreML when available.
+The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`** (`auto`, `cpu`, `coreml`, `directml`). On Apple platforms, `auto` prefers CoreML when available. On Windows builds with the `directml` feature, `auto` prefers DirectML before CPU.
 
 The CLI also accepts `--backend`, `--backend-fallback`, `--vocoder-ep`, and `--vocoder-ep-fallback`, which override the environment variables for that invocation.
 
