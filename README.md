@@ -1,5 +1,14 @@
 # qts
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Tests](https://github.com/yet-another-ai/qts/actions/workflows/test.yml/badge.svg)](https://github.com/yet-another-ai/qts/actions/workflows/test.yml)
+[![Build](https://github.com/yet-another-ai/qts/actions/workflows/build.yml/badge.svg)](https://github.com/yet-another-ai/qts/actions/workflows/build.yml)
+
+[![crates.io: qts](https://img.shields.io/crates/v/qts.svg?label=qts&logo=rust)](https://crates.io/crates/qts)
+[![crates.io: qts_cli](https://img.shields.io/crates/v/qts_cli.svg?label=qts_cli&logo=rust)](https://crates.io/crates/qts_cli)
+[![crates.io: qts_ggml](https://img.shields.io/crates/v/qts_ggml.svg?label=qts_ggml&logo=rust)](https://crates.io/crates/qts_ggml)
+[![crates.io: qts_ggml_sys](https://img.shields.io/crates/v/qts_ggml_sys.svg?label=qts_ggml_sys&logo=rust)](https://crates.io/crates/qts_ggml_sys)
+
 **On-device [Qwen3 TTS](https://github.com/QwenLM/Qwen3-TTS)** in Rust: the speech model runs in **[ggml](https://github.com/ggml-org/ggml)** (GGUF weights), and the vocoder runs in **ONNX Runtime**. No server required—everything stays on your machine.
 
 | If you want to… | Start here |
