@@ -845,10 +845,7 @@ impl Vocoder {
     }
 
     #[cfg(feature = "coreml")]
-    fn register_coreml(
-        builder: &mut SessionBuilder,
-        required: bool,
-    ) -> Result<(), Qwen3TtsError> {
+    fn register_coreml(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
         Self::register_ort_execution_provider(
             builder,
             required,
@@ -926,10 +923,7 @@ impl Vocoder {
     }
 
     #[cfg(feature = "onednn")]
-    fn register_onednn(
-        builder: &mut SessionBuilder,
-        required: bool,
-    ) -> Result<(), Qwen3TtsError> {
+    fn register_onednn(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
         Self::register_ort_execution_provider(
             builder,
             required,
@@ -1031,10 +1025,7 @@ impl Vocoder {
     }
 
     #[cfg(feature = "webgpu")]
-    fn register_webgpu(
-        builder: &mut SessionBuilder,
-        required: bool,
-    ) -> Result<(), Qwen3TtsError> {
+    fn register_webgpu(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
         Self::register_ort_execution_provider(
             builder,
             required,
@@ -1046,10 +1037,7 @@ impl Vocoder {
     }
 
     #[cfg(feature = "xnnpack")]
-    fn register_xnnpack(
-        builder: &mut SessionBuilder,
-        required: bool,
-    ) -> Result<(), Qwen3TtsError> {
+    fn register_xnnpack(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
         Self::register_ort_execution_provider(
             builder,
             required,
