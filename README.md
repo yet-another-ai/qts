@@ -58,7 +58,7 @@
      --out hello.wav
    ```
 
-On **Apple Silicon**, default features include Metal and CoreML where applicable. On **Linux / Windows**, Vulkan and DirectML are available via feature flags (see [Build options](#build-options)).
+On **Apple Silicon**, default features include Metal and CoreML where applicable. On **Linux / Windows**, the default build also enables the NVIDIA-oriented vocoder EPs `cuda`, `nvrtx`, and `tensorrt`; DirectML remains available via an extra feature flag on Windows (see [Build options](#build-options)).
 
 ---
 
@@ -88,7 +88,9 @@ On **Apple Silicon**, default features include Metal and CoreML where applicable
 cargo build -p qts_cli
 cargo build -p qts_cli --features metal    # Apple GPU (GGML)
 cargo build -p qts_cli --features vulkan   # Vulkan (GGML); needs SDK + `glslc` where applicable
+cargo build -p qts_cli --features tensorrt # NVIDIA TensorRT vocoder
 cargo build -p qts_cli --features directml # Windows vocoder (ONNX DirectML)
+cargo build -p qts_cli --features cuda     # NVIDIA vocoder (ONNX CUDA)
 ```
 
 **Library-only** examples:
@@ -98,7 +100,7 @@ cargo build -p qts --features metal
 cargo build -p qts --features vulkan
 ```
 
-GPU features are declared on `qts_ggml_sys` / `qts`; details and version pins live in [VERSIONS.md](VERSIONS.md).
+GPU features are declared on `qts_ggml_sys` / `qts`; details and version pins live in [VERSIONS.md](VERSIONS.md). For the vocoder, `qts` and `qts_cli` forward the native ONNX Runtime EP feature set directly, including `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `rocm`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack`. The default feature set now includes `cuda`, `nvrtx`, and `tensorrt` in addition to the existing GGML defaults.
 
 **Runtime behavior:** with GPU features enabled, `auto` prefers **Metal** on Apple and **Vulkan** on other platforms, then falls back to **CPU** if init fails. Builds without those features use **CPU** only for GGML.
 
@@ -162,7 +164,7 @@ cargo run --release -p qts_cli -- synthesize \
   --out out.wav
 ```
 
-Useful knobs include `--threads`, `--frames` (max audio frames), `--temperature`, `--top-p`, `--top-k`, `--language-id`, and `--chunk-size` (see `--help` on the binary). Backend overrides: `--backend`, `--vocoder-ep`, plus fallback chains.
+Useful knobs include `--threads`, `--frames` (max audio frames), `--temperature`, `--top-p`, `--top-k`, `--language-id`, and `--chunk-size` (see `--help` on the binary). Backend overrides: `--backend`, `--vocoder-ep`, plus fallback chains. `--vocoder-ep` accepts `auto` or any enabled native ORT EP token such as `coreml`, `directml`, `cuda`, `openvino`, `tensorrt`, or `xnnpack`.
 
 ### Voice clone prompts
 
@@ -260,8 +262,8 @@ cargo run --release -p qts_cli --no-default-features --features vulkan,directml 
 | Platform | Transformer | Vocoder |
 |----------|-------------|---------|
 | Apple | `metal,vulkan,cpu` | `coreml,cpu` |
-| Windows (with `directml` feature) | `vulkan,cpu` | `directml,cpu` |
-| Other | `vulkan,cpu` | `cpu` |
+| Windows | `vulkan,cpu` | `cuda,nvrtx,tensorrt,directml,cpu` |
+| Linux / Other | `vulkan,cpu` | `cuda,nvrtx,tensorrt,cpu` |
 
 ---
 
@@ -273,7 +275,7 @@ cargo run --release -p qts_cli --no-default-features --features vulkan,directml 
 | ONNX vocoder EP | `--vocoder-ep`, `--vocoder-ep-fallback` | `QWEN3_TTS_VOCODER_EP`, `QWEN3_TTS_VOCODER_EP_FALLBACK` |
 | Multi-GPU adapter index | — | `QWEN3_TTS_GPU_DEVICE` (default `0`; e.g. `Vulkan0`, `MTL0`) |
 
-When using `cargo run -p qts_cli` directly, **Cargo features** (e.g. `--features vulkan`) must include the backend you select with `QWEN3_TTS_BACKEND`, or init will fail.
+When using `cargo run -p qts_cli` directly, **Cargo features** (e.g. `--features vulkan` or `--features cuda`) must include the backend / execution provider you select with `QWEN3_TTS_BACKEND` or `QWEN3_TTS_VOCODER_EP`, or init will fail. The vocoder accepts the native ORT EP tokens `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `rocm`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack` when the matching feature is enabled.
 
 **Profiling:** `cargo xtask profile` runs the CLI with matching features and sets `QWEN3_TTS_BACKEND` for you (important for Vulkan on macOS). Example:
 

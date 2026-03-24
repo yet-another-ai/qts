@@ -36,6 +36,12 @@ cargo check -p qts --no-default-features --features vulkan
 # Windows DirectML vocoder path (features pass through to `qts`)
 cargo check -p qts_cli --no-default-features --features directml
 
+# Linux CUDA vocoder path
+cargo check -p qts_cli --no-default-features --features cuda
+
+# x86_64 Linux / Windows OpenVINO vocoder path
+cargo check -p qts_cli --no-default-features --features openvino
+
 # CLI crate (same feature flags pass through to `qts`)
 cargo check -p qts_cli
 ```
@@ -64,7 +70,7 @@ The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machin
 
 Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). When profiling with Vulkan on macOS (MoltenVK), build with `--features vulkan` and set `QWEN3_TTS_BACKEND=vulkan` for the CLI process.
 
-The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`** (`auto`, `cpu`, `coreml`, `directml`). On Apple platforms, `auto` prefers CoreML when available. On Windows builds with the `directml` feature, `auto` prefers DirectML before CPU.
+The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`**. Supported tokens are `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `rocm`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack`, subject to the corresponding Cargo feature being enabled in the binary. On Apple platforms, `auto` prefers CoreML when available. On Windows, `auto` now tries `cuda,nvrtx,tensorrt,directml,cpu`. On Linux and other non-Apple targets, `auto` tries `cuda,nvrtx,tensorrt,cpu`.
 
 The CLI also accepts `--backend`, `--backend-fallback`, `--vocoder-ep`, and `--vocoder-ep-fallback`, which override the environment variables for that invocation.
 

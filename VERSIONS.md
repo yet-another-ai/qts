@@ -57,14 +57,34 @@ cargo build -p ggml-sys
 - Reference only:
   - [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) for module boundaries, metadata keys, and tensor naming
 
-| Feature | Effect |
-|---------|--------|
-| `hf` | Hugging Face download helpers. |
-| `metal` | Enables Metal in GGML. Runtime: with `QWEN3_TTS_BACKEND=auto` (default), Apple builds prefer Metal then CPU; set `QWEN3_TTS_BACKEND=metal` to require Metal. |
-| `vulkan` | Enables Vulkan in GGML on all targets. Runtime: `auto` uses Vulkan only on **non-Apple** (then CPU fallback). On **Apple**, set **`QWEN3_TTS_BACKEND=vulkan`** to select Vulkan (MoltenVK); otherwise `auto` will not pick Vulkan. |
-| `coreml` | Enables the ONNX Runtime CoreML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers CoreML on Apple platforms, otherwise CPU. |
-| `directml` | Enables the ONNX Runtime DirectML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers DirectML on Windows builds with this feature, otherwise CPU. |
-| `native` | Enable host-CPU-specific ggml kernels for less portable but faster CPU binaries. |
+| Feature | CPU | GPU | NPU | GGML | Vocoder | Effect |
+|---------|-----|-----|-----|------|---------|--------|
+| `hf` | [ ] | [ ] | [ ] | [ ] | [ ] | Hugging Face download helpers. |
+| `native` | [x] | [ ] | [ ] | [x] | [ ] | Enable host-CPU-specific ggml kernels for less portable but faster CPU binaries. |
+| `metal` | [ ] | [x] | [ ] | [x] | [ ] | Enables Metal in GGML. Runtime: with `QWEN3_TTS_BACKEND=auto` (default), Apple builds prefer Metal then CPU; set `QWEN3_TTS_BACKEND=metal` to require Metal. |
+| `vulkan` | [ ] | [x] | [ ] | [x] | [ ] | Enables Vulkan in GGML on all targets. Runtime: `auto` uses Vulkan only on **non-Apple** (then CPU fallback). On **Apple**, set **`QWEN3_TTS_BACKEND=vulkan`** to select Vulkan (MoltenVK); otherwise `auto` will not pick Vulkan. |
+| `acl` | [x] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime ACL execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=acl` or include `acl` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `armnn` | [x] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime ArmNN execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=armnn` or include `armnn` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `azure` | [ ] | [ ] | [ ] | [ ] | [x] | Enables the ONNX Runtime Azure execution provider for the vocoder. This is a remote / service-backed EP, so it does not map cleanly to local CPU / GPU / NPU buckets. Runtime: select with `QWEN3_TTS_VOCODER_EP=azure` or include `azure` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `cann` | [ ] | [ ] | [x] | [ ] | [x] | Enables the ONNX Runtime CANN execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=cann` or include `cann` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `coreml` | [ ] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime CoreML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers CoreML on Apple platforms; you can also require it with `QWEN3_TTS_VOCODER_EP=coreml`. |
+| `cuda` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime CUDA execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=cuda` or include `cuda` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `directml` | [ ] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime DirectML execution provider for the vocoder. Runtime: `QWEN3_TTS_VOCODER_EP=auto` prefers DirectML on Windows builds with this feature; you can also require it with `QWEN3_TTS_VOCODER_EP=directml`. |
+| `migraphx` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime MIGraphX execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=migraphx` or include `migraphx` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `nnapi` | [ ] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime NNAPI execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=nnapi` or include `nnapi` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `nvrtx` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime NVRTX execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=nvrtx` or include `nvrtx` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `onednn` | [x] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime oneDNN execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=onednn` or include `onednn` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `openvino` | [x] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime OpenVINO execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=openvino` or include `openvino` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `qnn` | [ ] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime QNN execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=qnn` or include `qnn` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `rknpu` | [ ] | [ ] | [x] | [ ] | [x] | Enables the ONNX Runtime RKNPU execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=rknpu` or include `rknpu` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `rocm` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime ROCm execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=rocm` or include `rocm` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `tensorrt` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime TensorRT execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=tensorrt` or include `tensorrt` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `tvm` | [x] | [x] | [x] | [ ] | [x] | Enables the ONNX Runtime TVM execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=tvm` or include `tvm` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `vitis` | [ ] | [ ] | [x] | [ ] | [x] | Enables the ONNX Runtime Vitis execution provider for the vocoder. It is often associated with FPGA / accelerator flows; the checkbox marks the closest fit here as NPU-style offload. Runtime: select with `QWEN3_TTS_VOCODER_EP=vitis` or include `vitis` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `webgpu` | [ ] | [x] | [ ] | [ ] | [x] | Enables the ONNX Runtime WebGPU execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=webgpu` or include `webgpu` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+| `xnnpack` | [x] | [ ] | [ ] | [ ] | [x] | Enables the ONNX Runtime XNNPACK execution provider for the vocoder. Runtime: select with `QWEN3_TTS_VOCODER_EP=xnnpack` or include `xnnpack` in `QWEN3_TTS_VOCODER_EP_FALLBACK`. |
+
+The table is intentionally **feature-first** so a future backend can list multiple consumers in the same row once it is used by both GGML and the vocoder.
 
 ## Vulkan prerequisites
 

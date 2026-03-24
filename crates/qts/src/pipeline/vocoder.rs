@@ -5,9 +5,11 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(any(feature = "coreml", feature = "directml"))]
 use ort::ep::ExecutionProvider;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{
+    builder::{GraphOptimizationLevel, SessionBuilder},
+    Session,
+};
 use ort::value::Tensor;
 
 use super::backend::BackendKind;
@@ -36,12 +38,54 @@ enum RequestedExecutionProvider {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionProviderParseError {
+    Unknown,
+    MissingFeature(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VocoderExecutionProvider {
     Cpu,
+    #[cfg(feature = "acl")]
+    Acl,
+    #[cfg(feature = "armnn")]
+    ArmNn,
+    #[cfg(feature = "azure")]
+    Azure,
+    #[cfg(feature = "cann")]
+    Cann,
     #[cfg(feature = "coreml")]
     CoreMl,
+    #[cfg(feature = "cuda")]
+    Cuda,
     #[cfg(feature = "directml")]
     DirectMl,
+    #[cfg(feature = "migraphx")]
+    MigraphX,
+    #[cfg(feature = "nnapi")]
+    Nnapi,
+    #[cfg(feature = "nvrtx")]
+    Nvrtx,
+    #[cfg(feature = "onednn")]
+    OneDnn,
+    #[cfg(feature = "openvino")]
+    OpenVino,
+    #[cfg(feature = "qnn")]
+    Qnn,
+    #[cfg(feature = "rknpu")]
+    Rknpu,
+    #[cfg(feature = "rocm")]
+    Rocm,
+    #[cfg(feature = "tensorrt")]
+    TensorRt,
+    #[cfg(feature = "tvm")]
+    Tvm,
+    #[cfg(feature = "vitis")]
+    Vitis,
+    #[cfg(feature = "webgpu")]
+    WebGpu,
+    #[cfg(feature = "xnnpack")]
+    Xnnpack,
 }
 
 impl VocoderExecutionProvider {
@@ -49,10 +93,46 @@ impl VocoderExecutionProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
+            #[cfg(feature = "acl")]
+            Self::Acl => "acl",
+            #[cfg(feature = "armnn")]
+            Self::ArmNn => "armnn",
+            #[cfg(feature = "azure")]
+            Self::Azure => "azure",
+            #[cfg(feature = "cann")]
+            Self::Cann => "cann",
             #[cfg(feature = "coreml")]
             Self::CoreMl => "coreml",
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "cuda",
             #[cfg(feature = "directml")]
             Self::DirectMl => "directml",
+            #[cfg(feature = "migraphx")]
+            Self::MigraphX => "migraphx",
+            #[cfg(feature = "nnapi")]
+            Self::Nnapi => "nnapi",
+            #[cfg(feature = "nvrtx")]
+            Self::Nvrtx => "nvrtx",
+            #[cfg(feature = "onednn")]
+            Self::OneDnn => "onednn",
+            #[cfg(feature = "openvino")]
+            Self::OpenVino => "openvino",
+            #[cfg(feature = "qnn")]
+            Self::Qnn => "qnn",
+            #[cfg(feature = "rknpu")]
+            Self::Rknpu => "rknpu",
+            #[cfg(feature = "rocm")]
+            Self::Rocm => "rocm",
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt => "tensorrt",
+            #[cfg(feature = "tvm")]
+            Self::Tvm => "tvm",
+            #[cfg(feature = "vitis")]
+            Self::Vitis => "vitis",
+            #[cfg(feature = "webgpu")]
+            Self::WebGpu => "webgpu",
+            #[cfg(feature = "xnnpack")]
+            Self::Xnnpack => "xnnpack",
         }
     }
 
@@ -60,10 +140,258 @@ impl VocoderExecutionProvider {
     pub fn display_str(self) -> &'static str {
         match self {
             Self::Cpu => "ORT/CPU",
+            #[cfg(feature = "acl")]
+            Self::Acl => "ORT/ACL",
+            #[cfg(feature = "armnn")]
+            Self::ArmNn => "ORT/ArmNN",
+            #[cfg(feature = "azure")]
+            Self::Azure => "ORT/Azure",
+            #[cfg(feature = "cann")]
+            Self::Cann => "ORT/CANN",
             #[cfg(feature = "coreml")]
             Self::CoreMl => "ORT/CoreML",
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "ORT/CUDA",
             #[cfg(feature = "directml")]
             Self::DirectMl => "ORT/DirectML",
+            #[cfg(feature = "migraphx")]
+            Self::MigraphX => "ORT/MIGraphX",
+            #[cfg(feature = "nnapi")]
+            Self::Nnapi => "ORT/NNAPI",
+            #[cfg(feature = "nvrtx")]
+            Self::Nvrtx => "ORT/NVRTX",
+            #[cfg(feature = "onednn")]
+            Self::OneDnn => "ORT/oneDNN",
+            #[cfg(feature = "openvino")]
+            Self::OpenVino => "ORT/OpenVINO",
+            #[cfg(feature = "qnn")]
+            Self::Qnn => "ORT/QNN",
+            #[cfg(feature = "rknpu")]
+            Self::Rknpu => "ORT/RKNPU",
+            #[cfg(feature = "rocm")]
+            Self::Rocm => "ORT/ROCm",
+            #[cfg(feature = "tensorrt")]
+            Self::TensorRt => "ORT/TensorRT",
+            #[cfg(feature = "tvm")]
+            Self::Tvm => "ORT/TVM",
+            #[cfg(feature = "vitis")]
+            Self::Vitis => "ORT/Vitis",
+            #[cfg(feature = "webgpu")]
+            Self::WebGpu => "ORT/WebGPU",
+            #[cfg(feature = "xnnpack")]
+            Self::Xnnpack => "ORT/XNNPACK",
+        }
+    }
+
+    #[must_use]
+    fn expected_values() -> &'static str {
+        "cpu, acl, armnn, azure, cann, coreml, cuda, directml, migraphx, nnapi, nvrtx, onednn, openvino, qnn, rknpu, rocm, tensorrt, tvm, vitis, webgpu, xnnpack"
+    }
+
+    fn parse_token(value: &str) -> Result<Self, ExecutionProviderParseError> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "acl" => {
+                #[cfg(feature = "acl")]
+                {
+                    Ok(Self::Acl)
+                }
+                #[cfg(not(feature = "acl"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("acl"))
+                }
+            }
+            "armnn" => {
+                #[cfg(feature = "armnn")]
+                {
+                    Ok(Self::ArmNn)
+                }
+                #[cfg(not(feature = "armnn"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("armnn"))
+                }
+            }
+            "azure" => {
+                #[cfg(feature = "azure")]
+                {
+                    Ok(Self::Azure)
+                }
+                #[cfg(not(feature = "azure"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("azure"))
+                }
+            }
+            "cann" => {
+                #[cfg(feature = "cann")]
+                {
+                    Ok(Self::Cann)
+                }
+                #[cfg(not(feature = "cann"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("cann"))
+                }
+            }
+            "coreml" => {
+                #[cfg(feature = "coreml")]
+                {
+                    Ok(Self::CoreMl)
+                }
+                #[cfg(not(feature = "coreml"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("coreml"))
+                }
+            }
+            "cuda" => {
+                #[cfg(feature = "cuda")]
+                {
+                    Ok(Self::Cuda)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("cuda"))
+                }
+            }
+            "directml" => {
+                #[cfg(feature = "directml")]
+                {
+                    Ok(Self::DirectMl)
+                }
+                #[cfg(not(feature = "directml"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("directml"))
+                }
+            }
+            "migraphx" => {
+                #[cfg(feature = "migraphx")]
+                {
+                    Ok(Self::MigraphX)
+                }
+                #[cfg(not(feature = "migraphx"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("migraphx"))
+                }
+            }
+            "nnapi" => {
+                #[cfg(feature = "nnapi")]
+                {
+                    Ok(Self::Nnapi)
+                }
+                #[cfg(not(feature = "nnapi"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("nnapi"))
+                }
+            }
+            "nvrtx" => {
+                #[cfg(feature = "nvrtx")]
+                {
+                    Ok(Self::Nvrtx)
+                }
+                #[cfg(not(feature = "nvrtx"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("nvrtx"))
+                }
+            }
+            "onednn" => {
+                #[cfg(feature = "onednn")]
+                {
+                    Ok(Self::OneDnn)
+                }
+                #[cfg(not(feature = "onednn"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("onednn"))
+                }
+            }
+            "openvino" => {
+                #[cfg(feature = "openvino")]
+                {
+                    Ok(Self::OpenVino)
+                }
+                #[cfg(not(feature = "openvino"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("openvino"))
+                }
+            }
+            "qnn" => {
+                #[cfg(feature = "qnn")]
+                {
+                    Ok(Self::Qnn)
+                }
+                #[cfg(not(feature = "qnn"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("qnn"))
+                }
+            }
+            "rknpu" => {
+                #[cfg(feature = "rknpu")]
+                {
+                    Ok(Self::Rknpu)
+                }
+                #[cfg(not(feature = "rknpu"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("rknpu"))
+                }
+            }
+            "rocm" => {
+                #[cfg(feature = "rocm")]
+                {
+                    Ok(Self::Rocm)
+                }
+                #[cfg(not(feature = "rocm"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("rocm"))
+                }
+            }
+            "tensorrt" => {
+                #[cfg(feature = "tensorrt")]
+                {
+                    Ok(Self::TensorRt)
+                }
+                #[cfg(not(feature = "tensorrt"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("tensorrt"))
+                }
+            }
+            "tvm" => {
+                #[cfg(feature = "tvm")]
+                {
+                    Ok(Self::Tvm)
+                }
+                #[cfg(not(feature = "tvm"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("tvm"))
+                }
+            }
+            "vitis" => {
+                #[cfg(feature = "vitis")]
+                {
+                    Ok(Self::Vitis)
+                }
+                #[cfg(not(feature = "vitis"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("vitis"))
+                }
+            }
+            "webgpu" => {
+                #[cfg(feature = "webgpu")]
+                {
+                    Ok(Self::WebGpu)
+                }
+                #[cfg(not(feature = "webgpu"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("webgpu"))
+                }
+            }
+            "xnnpack" => {
+                #[cfg(feature = "xnnpack")]
+                {
+                    Ok(Self::Xnnpack)
+                }
+                #[cfg(not(feature = "xnnpack"))]
+                {
+                    Err(ExecutionProviderParseError::MissingFeature("xnnpack"))
+                }
+            }
+            _ => Err(ExecutionProviderParseError::Unknown),
         }
     }
 }
@@ -75,81 +403,56 @@ fn parse_requested_execution_provider() -> Result<RequestedExecutionProvider, Qw
     let value = raw.to_string_lossy();
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(RequestedExecutionProvider::Auto),
-        "cpu" => Ok(RequestedExecutionProvider::Explicit(
-            VocoderExecutionProvider::Cpu,
-        )),
-        "coreml" => {
-            #[cfg(feature = "coreml")]
-            {
-                Ok(RequestedExecutionProvider::Explicit(
-                    VocoderExecutionProvider::CoreMl,
-                ))
+        other => match VocoderExecutionProvider::parse_token(other) {
+            Ok(provider) => Ok(RequestedExecutionProvider::Explicit(provider)),
+            Err(ExecutionProviderParseError::MissingFeature(feature)) => {
+                Err(Qwen3TtsError::InvalidInput(format!(
+                    "unsupported QWEN3_TTS_VOCODER_EP={other}; binary was built without the {feature} feature"
+                )))
             }
-            #[cfg(not(feature = "coreml"))]
-            {
-                Err(Qwen3TtsError::InvalidInput(
-                    "unsupported QWEN3_TTS_VOCODER_EP=coreml; binary was built without the coreml feature"
-                        .into(),
-                ))
-            }
-        }
-        "directml" => {
-            #[cfg(feature = "directml")]
-            {
-                Ok(RequestedExecutionProvider::Explicit(
-                    VocoderExecutionProvider::DirectMl,
-                ))
-            }
-            #[cfg(not(feature = "directml"))]
-            {
-                Err(Qwen3TtsError::InvalidInput(
-                    "unsupported QWEN3_TTS_VOCODER_EP=directml; binary was built without the directml feature"
-                        .into(),
-                ))
-            }
-        }
-        other => Err(Qwen3TtsError::InvalidInput(format!(
-            "unsupported QWEN3_TTS_VOCODER_EP={other}; expected auto, cpu, coreml, or directml"
-        ))),
+            Err(ExecutionProviderParseError::Unknown) => Err(Qwen3TtsError::InvalidInput(
+                format!(
+                    "unsupported QWEN3_TTS_VOCODER_EP={other}; expected auto or one of {}",
+                    VocoderExecutionProvider::expected_values()
+                ),
+            )),
+        },
     }
 }
 
 fn default_auto_execution_provider_order() -> Vec<VocoderExecutionProvider> {
+    let mut order = Vec::new();
+
     #[cfg(target_vendor = "apple")]
     {
         #[cfg(feature = "coreml")]
         {
-            vec![
-                VocoderExecutionProvider::CoreMl,
-                VocoderExecutionProvider::Cpu,
-            ]
-        }
-        #[cfg(not(feature = "coreml"))]
-        {
-            vec![VocoderExecutionProvider::Cpu]
+            order.push(VocoderExecutionProvider::CoreMl);
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+
+    #[cfg(all(not(target_vendor = "apple"), feature = "cuda"))]
     {
-        #[cfg(target_os = "windows")]
-        {
-            #[cfg(feature = "directml")]
-            {
-                vec![
-                    VocoderExecutionProvider::DirectMl,
-                    VocoderExecutionProvider::Cpu,
-                ]
-            }
-            #[cfg(not(feature = "directml"))]
-            {
-                vec![VocoderExecutionProvider::Cpu]
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            vec![VocoderExecutionProvider::Cpu]
-        }
+        order.push(VocoderExecutionProvider::Cuda);
     }
+
+    #[cfg(all(not(target_vendor = "apple"), feature = "nvrtx"))]
+    {
+        order.push(VocoderExecutionProvider::Nvrtx);
+    }
+
+    #[cfg(all(not(target_vendor = "apple"), feature = "tensorrt"))]
+    {
+        order.push(VocoderExecutionProvider::TensorRt);
+    }
+
+    #[cfg(all(target_os = "windows", feature = "directml"))]
+    {
+        order.push(VocoderExecutionProvider::DirectMl);
+    }
+
+    order.push(VocoderExecutionProvider::Cpu);
+    order
 }
 
 fn parse_auto_execution_provider_order() -> Result<Vec<VocoderExecutionProvider>, Qwen3TtsError> {
@@ -163,37 +466,17 @@ fn parse_auto_execution_provider_order() -> Result<Vec<VocoderExecutionProvider>
         if value.is_empty() {
             continue;
         }
-        let provider = match value.as_str() {
-            "cpu" => VocoderExecutionProvider::Cpu,
-            "coreml" => {
-                #[cfg(feature = "coreml")]
-                {
-                    VocoderExecutionProvider::CoreMl
-                }
-                #[cfg(not(feature = "coreml"))]
-                {
-                    return Err(Qwen3TtsError::InvalidInput(
-                        "QWEN3_TTS_VOCODER_EP_FALLBACK includes coreml, but the binary was built without the coreml feature"
-                            .into(),
-                    ));
-                }
-            }
-            "directml" => {
-                #[cfg(feature = "directml")]
-                {
-                    VocoderExecutionProvider::DirectMl
-                }
-                #[cfg(not(feature = "directml"))]
-                {
-                    return Err(Qwen3TtsError::InvalidInput(
-                        "QWEN3_TTS_VOCODER_EP_FALLBACK includes directml, but the binary was built without the directml feature"
-                            .into(),
-                    ));
-                }
-            }
-            other => {
+        let provider = match VocoderExecutionProvider::parse_token(&value) {
+            Ok(provider) => provider,
+            Err(ExecutionProviderParseError::MissingFeature(feature)) => {
                 return Err(Qwen3TtsError::InvalidInput(format!(
-                    "QWEN3_TTS_VOCODER_EP_FALLBACK: unknown EP '{other}' (expected cpu, coreml, or directml)"
+                    "QWEN3_TTS_VOCODER_EP_FALLBACK includes {value}, but the binary was built without the {feature} feature"
+                )));
+            }
+            Err(ExecutionProviderParseError::Unknown) => {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "QWEN3_TTS_VOCODER_EP_FALLBACK: unknown EP '{value}' (expected one of {})",
+                    VocoderExecutionProvider::expected_values()
                 )));
             }
         };
@@ -431,104 +714,400 @@ impl Vocoder {
 
     #[allow(unused_variables)]
     fn register_execution_provider(
-        builder: &mut ort::session::builder::SessionBuilder,
+        builder: &mut SessionBuilder,
         provider: VocoderExecutionProvider,
         required: bool,
     ) -> Result<(), Qwen3TtsError> {
         match provider {
             VocoderExecutionProvider::Cpu => Ok(()),
+            #[cfg(feature = "acl")]
+            VocoderExecutionProvider::Acl => Self::register_acl(builder, required),
+            #[cfg(feature = "armnn")]
+            VocoderExecutionProvider::ArmNn => Self::register_armnn(builder, required),
+            #[cfg(feature = "azure")]
+            VocoderExecutionProvider::Azure => Self::register_azure(builder, required),
+            #[cfg(feature = "cann")]
+            VocoderExecutionProvider::Cann => Self::register_cann(builder, required),
             #[cfg(feature = "coreml")]
             VocoderExecutionProvider::CoreMl => Self::register_coreml(builder, required),
+            #[cfg(feature = "cuda")]
+            VocoderExecutionProvider::Cuda => Self::register_cuda(builder, required),
             #[cfg(feature = "directml")]
             VocoderExecutionProvider::DirectMl => Self::register_directml(builder, required),
+            #[cfg(feature = "migraphx")]
+            VocoderExecutionProvider::MigraphX => Self::register_migraphx(builder, required),
+            #[cfg(feature = "nnapi")]
+            VocoderExecutionProvider::Nnapi => Self::register_nnapi(builder, required),
+            #[cfg(feature = "nvrtx")]
+            VocoderExecutionProvider::Nvrtx => Self::register_nvrtx(builder, required),
+            #[cfg(feature = "onednn")]
+            VocoderExecutionProvider::OneDnn => Self::register_onednn(builder, required),
+            #[cfg(feature = "openvino")]
+            VocoderExecutionProvider::OpenVino => Self::register_openvino(builder, required),
+            #[cfg(feature = "qnn")]
+            VocoderExecutionProvider::Qnn => Self::register_qnn(builder, required),
+            #[cfg(feature = "rknpu")]
+            VocoderExecutionProvider::Rknpu => Self::register_rknpu(builder, required),
+            #[cfg(feature = "rocm")]
+            VocoderExecutionProvider::Rocm => Self::register_rocm(builder, required),
+            #[cfg(feature = "tensorrt")]
+            VocoderExecutionProvider::TensorRt => Self::register_tensorrt(builder, required),
+            #[cfg(feature = "tvm")]
+            VocoderExecutionProvider::Tvm => Self::register_tvm(builder, required),
+            #[cfg(feature = "vitis")]
+            VocoderExecutionProvider::Vitis => Self::register_vitis(builder, required),
+            #[cfg(feature = "webgpu")]
+            VocoderExecutionProvider::WebGpu => Self::register_webgpu(builder, required),
+            #[cfg(feature = "xnnpack")]
+            VocoderExecutionProvider::Xnnpack => Self::register_xnnpack(builder, required),
         }
+    }
+
+    #[allow(dead_code)]
+    fn register_ort_execution_provider<E: ExecutionProvider>(
+        builder: &mut SessionBuilder,
+        required: bool,
+        provider: E,
+        provider_token: &'static str,
+        provider_label: &'static str,
+        supported_platforms: &'static str,
+    ) -> Result<(), Qwen3TtsError> {
+        if !provider.supported_by_platform() {
+            if required {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "QWEN3_TTS_VOCODER_EP={provider_token} is only supported on {supported_platforms}"
+                )));
+            }
+            return Err(Qwen3TtsError::InvalidInput(format!(
+                "{provider_token} EP is not supported on this platform"
+            )));
+        }
+        if !provider.is_available().map_err(ort_err)? {
+            if required {
+                return Err(Qwen3TtsError::InvalidInput(format!(
+                    "QWEN3_TTS_VOCODER_EP={provider_token} requested, but this build of ONNX Runtime does not include {provider_label}"
+                )));
+            }
+            return Err(Qwen3TtsError::InvalidInput(format!(
+                "{provider_token} EP is not available in this ONNX Runtime build"
+            )));
+        }
+        provider.register(builder).map_err(ort_err)
+    }
+
+    #[cfg(feature = "acl")]
+    fn register_acl(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::ACL::default(),
+            "acl",
+            "ACL",
+            "Arm platforms",
+        )
+    }
+
+    #[cfg(feature = "armnn")]
+    #[allow(deprecated)]
+    fn register_armnn(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::ArmNN::default(),
+            "armnn",
+            "ArmNN",
+            "Arm platforms",
+        )
+    }
+
+    #[cfg(feature = "azure")]
+    fn register_azure(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::Azure::default(),
+            "azure",
+            "Azure",
+            "supported native platforms",
+        )
+    }
+
+    #[cfg(feature = "cann")]
+    fn register_cann(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::CANN::default(),
+            "cann",
+            "CANN",
+            "Linux",
+        )
     }
 
     #[cfg(feature = "coreml")]
     fn register_coreml(
-        builder: &mut ort::session::builder::SessionBuilder,
+        builder: &mut SessionBuilder,
         required: bool,
     ) -> Result<(), Qwen3TtsError> {
-        let coreml = ort::ep::CoreML::default();
-        if !coreml.supported_by_platform() {
-            if required {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_VOCODER_EP=coreml is only supported on Apple platforms".into(),
-                ));
-            }
-            return Err(Qwen3TtsError::InvalidInput(
-                "coreml EP is not supported on this platform".into(),
-            ));
-        }
-        if !coreml.is_available().map_err(ort_err)? {
-            if required {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_VOCODER_EP=coreml requested, but this build of ONNX Runtime does not include CoreML".into(),
-                ));
-            }
-            return Err(Qwen3TtsError::InvalidInput(
-                "coreml EP is not available in this ONNX Runtime build".into(),
-            ));
-        }
-        match coreml.register(builder) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(ort_err(err)),
-        }
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::CoreML::default(),
+            "coreml",
+            "CoreML",
+            "Apple platforms",
+        )
     }
 
-    #[cfg(not(feature = "coreml"))]
-    #[allow(dead_code)]
-    fn register_coreml(
-        _builder: &mut ort::session::builder::SessionBuilder,
-        _required: bool,
-    ) -> Result<(), Qwen3TtsError> {
-        Err(Qwen3TtsError::InvalidInput(
-            "coreml EP is unavailable because the binary was built without the coreml feature"
-                .into(),
-        ))
+    #[cfg(feature = "cuda")]
+    fn register_cuda(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::CUDA::default(),
+            "cuda",
+            "CUDA",
+            "Windows or Linux",
+        )
     }
 
     #[cfg(feature = "directml")]
     fn register_directml(
-        builder: &mut ort::session::builder::SessionBuilder,
+        builder: &mut SessionBuilder,
         required: bool,
     ) -> Result<(), Qwen3TtsError> {
-        let directml = ort::ep::DirectML::default();
-        if !directml.supported_by_platform() {
-            if required {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_VOCODER_EP=directml is only supported on Windows".into(),
-                ));
-            }
-            return Err(Qwen3TtsError::InvalidInput(
-                "directml EP is not supported on this platform".into(),
-            ));
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::DirectML::default(),
+            "directml",
+            "DirectML",
+            "Windows",
+        )
+    }
+
+    #[cfg(feature = "migraphx")]
+    fn register_migraphx(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::MIGraphX::default(),
+            "migraphx",
+            "MIGraphX",
+            "Linux",
+        )
+    }
+
+    #[cfg(feature = "nnapi")]
+    fn register_nnapi(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::NNAPI::default(),
+            "nnapi",
+            "NNAPI",
+            "Android",
+        )
+    }
+
+    #[cfg(feature = "nvrtx")]
+    fn register_nvrtx(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::NVRTX::default(),
+            "nvrtx",
+            "NVTX",
+            "supported native platforms",
+        )
+    }
+
+    #[cfg(feature = "onednn")]
+    fn register_onednn(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::OneDNN::default(),
+            "onednn",
+            "oneDNN",
+            "supported native platforms",
+        )
+    }
+
+    #[cfg(feature = "openvino")]
+    fn register_openvino(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::OpenVINO::default(),
+            "openvino",
+            "OpenVINO",
+            "x86_64 Windows or Linux",
+        )
+    }
+
+    #[cfg(feature = "qnn")]
+    fn register_qnn(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::QNN::default(),
+            "qnn",
+            "QNN",
+            "Windows, Linux, or Android",
+        )
+    }
+
+    #[cfg(feature = "rknpu")]
+    fn register_rknpu(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::RKNPU::default(),
+            "rknpu",
+            "RKNPU",
+            "Linux",
+        )
+    }
+
+    #[cfg(feature = "rocm")]
+    fn register_rocm(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::ROCm::default(),
+            "rocm",
+            "ROCm",
+            "Linux",
+        )
+    }
+
+    #[cfg(feature = "tensorrt")]
+    fn register_tensorrt(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::TensorRT::default(),
+            "tensorrt",
+            "TensorRT",
+            "Windows or Linux",
+        )
+    }
+
+    #[cfg(feature = "tvm")]
+    fn register_tvm(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::TVM::default(),
+            "tvm",
+            "TVM",
+            "supported native platforms",
+        )
+    }
+
+    #[cfg(feature = "vitis")]
+    fn register_vitis(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::Vitis::default(),
+            "vitis",
+            "Vitis",
+            "Linux",
+        )
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn register_webgpu(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::WebGPU::default(),
+            "webgpu",
+            "WebGPU",
+            "supported native platforms",
+        )
+    }
+
+    #[cfg(feature = "xnnpack")]
+    fn register_xnnpack(
+        builder: &mut SessionBuilder,
+        required: bool,
+    ) -> Result<(), Qwen3TtsError> {
+        Self::register_ort_execution_provider(
+            builder,
+            required,
+            ort::ep::XNNPACK::default(),
+            "xnnpack",
+            "XNNPACK",
+            "supported Arm or x86_64 platforms",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_var(name: &str, value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let old = env::var_os(name);
+        match value {
+            Some(value) => unsafe { env::set_var(name, value) },
+            None => unsafe { env::remove_var(name) },
         }
-        if !directml.is_available().map_err(ort_err)? {
-            if required {
-                return Err(Qwen3TtsError::InvalidInput(
-                    "QWEN3_TTS_VOCODER_EP=directml requested, but this build of ONNX Runtime does not include DirectML".into(),
-                ));
-            }
-            return Err(Qwen3TtsError::InvalidInput(
-                "directml EP is not available in this ONNX Runtime build".into(),
-            ));
-        }
-        match directml.register(builder) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(ort_err(err)),
+        f();
+        match old {
+            Some(old) => unsafe { env::set_var(name, old) },
+            None => unsafe { env::remove_var(name) },
         }
     }
 
-    #[cfg(not(feature = "directml"))]
-    #[allow(dead_code)]
-    fn register_directml(
-        _builder: &mut ort::session::builder::SessionBuilder,
-        _required: bool,
-    ) -> Result<(), Qwen3TtsError> {
-        Err(Qwen3TtsError::InvalidInput(
-            "directml EP is unavailable because the binary was built without the directml feature"
-                .into(),
-        ))
+    #[test]
+    fn parses_cpu_explicit_ep() {
+        with_env_var("QWEN3_TTS_VOCODER_EP", Some("cpu"), || {
+            assert_eq!(
+                parse_requested_execution_provider().expect("parse should succeed"),
+                RequestedExecutionProvider::Explicit(VocoderExecutionProvider::Cpu)
+            );
+        });
+    }
+
+    #[test]
+    fn deduplicates_fallback_order() {
+        with_env_var("QWEN3_TTS_VOCODER_EP_FALLBACK", Some("cpu,cpu"), || {
+            assert_eq!(
+                parse_auto_execution_provider_order().expect("fallback parse should succeed"),
+                vec![VocoderExecutionProvider::Cpu]
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_unknown_fallback_ep() {
+        with_env_var("QWEN3_TTS_VOCODER_EP_FALLBACK", Some("mystery"), || {
+            let err = parse_auto_execution_provider_order().expect_err("parse should fail");
+            let msg = err.to_string();
+            assert!(msg.contains("unknown EP 'mystery'"));
+            assert!(msg.contains("xnnpack"));
+        });
     }
 }
