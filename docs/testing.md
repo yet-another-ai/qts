@@ -48,14 +48,6 @@ cargo check -p qts_cli
 
 For ONNX Runtime EPs, keep in mind that ort prebuilt binaries only cover specific feature bundles. Platform-native EPs like `directml`, `xnnpack`, and `coreml` are broadly available where supported, and ort also publishes prebuilt bundles for `cuda` + `tensorrt`, `webgpu`, and `nvrtx`. Mixed combinations outside those bundles may resolve to a CPU-only ORT download unless you build ONNX Runtime from source. That matters for this repo because the default Linux / Windows vocoder feature set now includes `cuda`, `nvrtx`, and `tensorrt` together.
 
-## Layer C — golden numerics (planned)
-
-Copy `reference/*.bin` from [qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) and add component tests with explicit tolerances (tokenizer, encoder, transformer, vocoder).
-
-## Layer D — heavy E2E (manual)
-
-Python or upstream `compare_e2e.py`-style checks should stay out of default PR CI.
-
 ## Benchmarks
 
 The Criterion target lives in the **`qts`** package (`synthesize` bench). Set `QWEN3_TTS_BENCH_MODEL_DIR` and optional tuning via `QWEN3_TTS_BENCH_*` env vars (see `crates/qts/benches/synthesize.rs`).
