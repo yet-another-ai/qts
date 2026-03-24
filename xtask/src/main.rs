@@ -122,12 +122,12 @@ fn run_profile(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     for backend in backends {
         let mut command = Command::new("cargo");
         command.current_dir(&workspace_root);
-        command.args(["run", "--release", "-p", "qwen3-tts-cli"]);
+        command.args(["run", "--release", "-p", "qts_cli"]);
         if backend != "cpu" {
             command.args(["--features", backend]);
         }
         // Decouple Cargo features from GGML backend selection: on macOS, Vulkan is only used when
-        // explicitly requested (see `QWEN3_TTS_BACKEND` in qwen3-tts `backend.rs`).
+        // explicitly requested (see `QWEN3_TTS_BACKEND` in `qts` `pipeline/backend.rs`).
         command.env("QWEN3_TTS_BACKEND", backend);
         command.arg("--");
         command.arg("profile");
@@ -328,7 +328,7 @@ fn run_single_bench(
     let mut command = Command::new("cargo");
     command.current_dir(workspace_root);
     command.arg("bench");
-    command.arg("-p").arg("qwen3-tts");
+    command.arg("-p").arg("qts");
     command.arg("--bench").arg("synthesize");
     match backend {
         "metal" => {
@@ -690,12 +690,12 @@ fn print_usage() {
 
 fn print_profile_help() {
     eprintln!(
-        "cargo xtask profile — run qwen3-tts-cli profile with optional backend feature\n\n\
+        "cargo xtask profile — run qts_cli profile with optional backend feature\n\n\
          usage:\n  cargo xtask profile [cpu|metal|vulkan|all|both] [-- ARGS_FOR_CLI...]\n\n\
          The first token selects both `cargo --features` and sets QWEN3_TTS_BACKEND for the child \
          (so macOS + vulkan actually uses the Vulkan GGML backend, not only links it).\n\n\
          Examples:\n  cargo xtask profile cpu --model-dir models/qwen3-tts-bundle --text hello --frames 32 --runs 3\n  cargo xtask profile metal --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64 --out /tmp/p.wav\n  cargo xtask profile vulkan --model-dir \"$QWEN3_TTS_MODEL_DIR\" --text hello --frames 64\n\n\
-         All flags after the optional backend token are passed to `qwen3-tts-cli profile`."
+         All flags after the optional backend token are passed to `qts_cli profile`."
     );
 }
 
