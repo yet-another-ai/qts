@@ -1,0 +1,14 @@
+name: "qts CodeQL Config"
+
+# Focus CodeQL on the maintained application and tooling code.
+paths:
+  - crates
+  - scripts
+  - xtask
+
+# Exclude vendored, generated, and large fixture/model content.
+paths-ignore:
+  - crates/qts_ggml_sys/vendor
+  - scripts/*_pb2.py
+  - testdata
+  - models
