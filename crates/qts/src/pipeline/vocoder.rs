@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::slice;
 use std::sync::{Mutex, OnceLock};
 
 use ort::ep::ExecutionProvider;
@@ -10,6 +11,8 @@ use ort::session::{
     builder::{GraphOptimizationLevel, SessionBuilder},
     Session,
 };
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::session::IoBinding;
 use ort::value::Tensor;
 
 use super::backend::BackendKind;
@@ -516,11 +519,21 @@ pub struct VocoderGraphTemplate {
     n_frames: usize,
 }
 
+struct CachedVocoderTemplate {
+    input: Tensor<i64>,
+    binding: IoBinding,
+}
+
+struct VocoderSessionState {
+    session: Session,
+    templates: HashMap<usize, CachedVocoderTemplate>,
+}
+
 pub struct Vocoder {
     config: VocoderConfig,
     model_path: PathBuf,
     execution_provider: VocoderExecutionProvider,
-    sessions: Mutex<HashMap<usize, Session>>,
+    sessions: Mutex<HashMap<usize, VocoderSessionState>>,
 }
 
 impl Vocoder {
@@ -533,7 +546,13 @@ impl Vocoder {
         ensure_ort_init()?;
         let (default_session, execution_provider) = Self::build_session(&path, 1)?;
         let mut sessions = HashMap::new();
-        sessions.insert(1, default_session);
+        sessions.insert(
+            1,
+            VocoderSessionState {
+                session: default_session,
+                templates: HashMap::new(),
+            },
+        );
 
         Ok(Self {
             config: VocoderConfig::default(),
@@ -618,21 +637,44 @@ impl Vocoder {
                     actual_ep.as_str()
                 )));
             }
-            e.insert(session);
+            e.insert(VocoderSessionState {
+                session,
+                templates: HashMap::new(),
+            });
         }
 
-        let session = sessions
+        let state = sessions
             .get_mut(&key)
             .ok_or_else(|| Qwen3TtsError::InvalidInput("missing ORT session".into()))?;
-        let shape = vec![1usize, template.n_frames, n_codebooks];
-        let input_codes = codes
-            .iter()
-            .copied()
-            .map(i64::from)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let input = Tensor::from_array((shape, input_codes)).map_err(ort_err)?;
-        let outputs = session.run(ort::inputs![input]).map_err(ort_err)?;
+        if !state.templates.contains_key(&template.n_frames) {
+            let cached = Self::create_cached_template(
+                &state.session,
+                template.n_frames,
+                self.config.n_codebooks as usize,
+                &self.model_path,
+            )?;
+            state.templates.insert(template.n_frames, cached);
+        }
+        let cached = state
+            .templates
+            .get_mut(&template.n_frames)
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("missing vocoder template".into()))?;
+        Self::write_codes_into_template(&mut cached.input, codes);
+        let input_name = state
+            .session
+            .inputs()
+            .first()
+            .ok_or_else(|| Qwen3TtsError::InvalidOnnx(self.model_path.clone()))?
+            .name()
+            .to_owned();
+        cached
+            .binding
+            .bind_input(input_name, &cached.input)
+            .map_err(ort_err)?;
+        let outputs = state
+            .session
+            .run_binding(&cached.binding)
+            .map_err(ort_err)?;
         if outputs.len() < 2 {
             return Err(Qwen3TtsError::InvalidOnnx(self.model_path.clone()));
         }
@@ -647,6 +689,55 @@ impl Vocoder {
             .unwrap_or(audio_values.len() as i64)
             .clamp(0, audio_values.len() as i64) as usize;
         Ok(audio_values[..sample_count].to_vec())
+    }
+
+    fn create_cached_template(
+        session: &Session,
+        n_frames: usize,
+        n_codebooks: usize,
+        model_path: &Path,
+    ) -> Result<CachedVocoderTemplate, Qwen3TtsError> {
+        let input = Tensor::<i64>::new(&ort::memory::Allocator::default(), [
+            1usize,
+            n_frames,
+            n_codebooks,
+        ])
+        .map_err(ort_err)?;
+        let mut binding = session.create_binding().map_err(ort_err)?;
+        let cpu_output = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::CPUOutput,
+        )
+        .map_err(ort_err)?;
+        let audio_name = session
+            .outputs()
+            .first()
+            .ok_or_else(|| Qwen3TtsError::InvalidOnnx(model_path.to_path_buf()))?
+            .name()
+            .to_owned();
+        let length_name = session
+            .outputs()
+            .get(1)
+            .ok_or_else(|| Qwen3TtsError::InvalidOnnx(model_path.to_path_buf()))?
+            .name()
+            .to_owned();
+        binding
+            .bind_output_to_device(audio_name, &cpu_output)
+            .map_err(ort_err)?;
+        binding
+            .bind_output_to_device(length_name, &cpu_output)
+            .map_err(ort_err)?;
+        Ok(CachedVocoderTemplate { input, binding })
+    }
+
+    fn write_codes_into_template(input: &mut Tensor<i64>, codes: &[i32]) {
+        let input_ptr = input.data_ptr_mut().cast::<i64>();
+        let input_values = unsafe { slice::from_raw_parts_mut(input_ptr, codes.len()) };
+        for (dst, src) in input_values.iter_mut().zip(codes.iter().copied()) {
+            *dst = i64::from(src);
+        }
     }
 
     fn build_session(
