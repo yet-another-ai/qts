@@ -878,13 +878,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2185,13 +2185,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2513,13 +2513,13 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2811,13 +2811,13 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3208,13 +3208,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3617,13 +3617,13 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = unsafe {
+            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
                 sys::ggml_cast(
                     ctx.as_ptr(),
                     layer.ffn_down.as_ptr(),
                     sys::ggml_type_GGML_TYPE_F32,
                 )
-            };
+            });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3784,7 +3784,7 @@ impl TalkerWeights {
         unsafe {
             sys::ggml_cpu_init();
         }
-        let tensor_count = 8 + cfg.n_layers as usize * 11;
+        let tensor_count = 8 + cfg.n_layers as usize * 12;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
         let text_embd = load_tensor_into_context(file, ctx.as_ptr(), "talker.text_embd.weight")?;
@@ -3812,6 +3812,7 @@ impl TalkerWeights {
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for layer_idx in 0..cfg.n_layers {
             let prefix = format!("talker.blk.{layer_idx}.");
+            let ffn_down_name = prefix.clone() + "ffn_down.weight";
             layers.push(TalkerLayerWeights {
                 attn_norm: load_tensor_into_context(
                     file,
@@ -3866,7 +3867,12 @@ impl TalkerWeights {
                 ffn_down: load_tensor_into_context(
                     file,
                     ctx.as_ptr(),
-                    &(prefix + "ffn_down.weight"),
+                    &ffn_down_name,
+                )?,
+                ffn_down_f32: load_tensor_f32_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &ffn_down_name,
                 )?,
             });
         }
@@ -3914,6 +3920,18 @@ impl TalkerWeights {
                     }
                 }
             }
+            if let Some(tensor) = layer.ffn_down_f32 {
+                let name = format!("talker.blk.{layer_idx}.ffn_down.weight");
+                let (_, raw) = file.read_tensor_f32(&name)?;
+                unsafe {
+                    sys::ggml_backend_tensor_set(
+                        tensor.as_ptr(),
+                        raw.as_ptr().cast(),
+                        0,
+                        std::mem::size_of_val(raw.as_slice()),
+                    );
+                }
+            }
         }
 
         Ok(Self {
@@ -3946,6 +3964,7 @@ struct TalkerLayerWeights {
     ffn_gate: NonNull<sys::ggml_tensor>,
     ffn_up: NonNull<sys::ggml_tensor>,
     ffn_down: NonNull<sys::ggml_tensor>,
+    ffn_down_f32: Option<NonNull<sys::ggml_tensor>>,
 }
 
 struct CodePredWeights {
@@ -4238,7 +4257,7 @@ impl CodePredWeights {
             sys::ggml_cpu_init();
         }
         let per_codebook = (cfg.n_codebooks - 1) as usize;
-        let tensor_count = 1 + per_codebook * 2 + cfg.code_pred_layers as usize * 11;
+        let tensor_count = 1 + per_codebook * 2 + cfg.code_pred_layers as usize * 12;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
         let mut embeddings = Vec::with_capacity(per_codebook);
@@ -4278,6 +4297,7 @@ impl CodePredWeights {
         let mut layers = Vec::with_capacity(cfg.code_pred_layers as usize);
         for layer_idx in 0..cfg.code_pred_layers {
             let prefix = format!("code_pred.blk.{layer_idx}.");
+            let ffn_down_name = prefix.clone() + "ffn_down.weight";
             layers.push(TalkerLayerWeights {
                 attn_norm: load_tensor_into_context(
                     file,
@@ -4332,7 +4352,12 @@ impl CodePredWeights {
                 ffn_down: load_tensor_into_context(
                     file,
                     ctx.as_ptr(),
-                    &(prefix + "ffn_down.weight"),
+                    &ffn_down_name,
+                )?,
+                ffn_down_f32: load_tensor_f32_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &ffn_down_name,
                 )?,
             });
         }
@@ -4388,6 +4413,18 @@ impl CodePredWeights {
                             raw.len(),
                         );
                     }
+                }
+            }
+            if let Some(tensor) = layer.ffn_down_f32 {
+                let name = format!("code_pred.blk.{layer_idx}.ffn_down.weight");
+                let (_, raw) = file.read_tensor_f32(&name)?;
+                unsafe {
+                    sys::ggml_backend_tensor_set(
+                        tensor.as_ptr(),
+                        raw.as_ptr().cast(),
+                        0,
+                        std::mem::size_of_val(raw.as_slice()),
+                    );
                 }
             }
         }
@@ -4489,6 +4526,28 @@ fn load_tensor_into_context(
     }
     let tensor = unsafe { sys::ggml_new_tensor(ctx, info.ty, info.dims.len() as i32, ne.as_ptr()) };
     NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
+}
+
+fn load_tensor_f32_into_context(
+    file: &GgufFile,
+    ctx: *mut sys::ggml_context,
+    name: &str,
+) -> Result<Option<NonNull<sys::ggml_tensor>>, Qwen3TtsError> {
+    let info = match file.tensor_info(name) {
+        Ok(info) => info,
+        Err(Qwen3TtsError::MissingTensor(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if file.read_tensor_f32(name).is_err() {
+        return Ok(None);
+    }
+    let mut ne = [1i64; 4];
+    for (idx, dim) in info.dims.iter().copied().enumerate() {
+        ne[idx] = dim as i64;
+    }
+    let tensor =
+        unsafe { sys::ggml_new_tensor(ctx, sys::ggml_type_GGML_TYPE_F32, info.dims.len() as i32, ne.as_ptr()) };
+    Ok(NonNull::new(tensor))
 }
 
 fn load_optional_tensor_into_context(
