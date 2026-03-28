@@ -74,8 +74,6 @@ pub enum VocoderExecutionProvider {
     Qnn,
     #[cfg(feature = "rknpu")]
     Rknpu,
-    #[cfg(feature = "rocm")]
-    Rocm,
     #[cfg(feature = "tensorrt")]
     TensorRt,
     #[cfg(feature = "tvm")]
@@ -121,8 +119,6 @@ impl VocoderExecutionProvider {
             Self::Qnn => "qnn",
             #[cfg(feature = "rknpu")]
             Self::Rknpu => "rknpu",
-            #[cfg(feature = "rocm")]
-            Self::Rocm => "rocm",
             #[cfg(feature = "tensorrt")]
             Self::TensorRt => "tensorrt",
             #[cfg(feature = "tvm")]
@@ -168,8 +164,6 @@ impl VocoderExecutionProvider {
             Self::Qnn => "ORT/QNN",
             #[cfg(feature = "rknpu")]
             Self::Rknpu => "ORT/RKNPU",
-            #[cfg(feature = "rocm")]
-            Self::Rocm => "ORT/ROCm",
             #[cfg(feature = "tensorrt")]
             Self::TensorRt => "ORT/TensorRT",
             #[cfg(feature = "tvm")]
@@ -185,7 +179,7 @@ impl VocoderExecutionProvider {
 
     #[must_use]
     fn expected_values() -> &'static str {
-        "cpu, acl, armnn, azure, cann, coreml, cuda, directml, migraphx, nnapi, nvrtx, onednn, openvino, qnn, rknpu, rocm, tensorrt, tvm, vitis, webgpu, xnnpack"
+        "cpu, acl, armnn, azure, cann, coreml, cuda, directml, migraphx, nnapi, nvrtx, onednn, openvino, qnn, rknpu, tensorrt, tvm, vitis, webgpu, xnnpack"
     }
 
     fn parse_token(value: &str) -> Result<Self, ExecutionProviderParseError> {
@@ -329,16 +323,6 @@ impl VocoderExecutionProvider {
                 #[cfg(not(feature = "rknpu"))]
                 {
                     Err(ExecutionProviderParseError::MissingFeature("rknpu"))
-                }
-            }
-            "rocm" => {
-                #[cfg(feature = "rocm")]
-                {
-                    Ok(Self::Rocm)
-                }
-                #[cfg(not(feature = "rocm"))]
-                {
-                    Err(ExecutionProviderParseError::MissingFeature("rocm"))
                 }
             }
             "tensorrt" => {
@@ -748,8 +732,6 @@ impl Vocoder {
             VocoderExecutionProvider::Qnn => Self::register_qnn(builder, required),
             #[cfg(feature = "rknpu")]
             VocoderExecutionProvider::Rknpu => Self::register_rknpu(builder, required),
-            #[cfg(feature = "rocm")]
-            VocoderExecutionProvider::Rocm => Self::register_rocm(builder, required),
             #[cfg(feature = "tensorrt")]
             VocoderExecutionProvider::TensorRt => Self::register_tensorrt(builder, required),
             #[cfg(feature = "tvm")]
@@ -969,18 +951,6 @@ impl Vocoder {
             ort::ep::RKNPU::default(),
             "rknpu",
             "RKNPU",
-            "Linux",
-        )
-    }
-
-    #[cfg(feature = "rocm")]
-    fn register_rocm(builder: &mut SessionBuilder, required: bool) -> Result<(), Qwen3TtsError> {
-        Self::register_ort_execution_provider(
-            builder,
-            required,
-            ort::ep::ROCm::default(),
-            "rocm",
-            "ROCm",
             "Linux",
         )
     }

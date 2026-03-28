@@ -846,7 +846,7 @@ fn warmup_engine(
 fn print_tui_usage() {
     eprintln!(
         "qwen3-tts-cli tui — interactive terminal mode with direct cpal playback\n\n\
-         usage:\n  tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|rocm|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\n\
+         usage:\n  tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\n\
          CLI flags override environment variables.\n\
          Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
          Default vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\n\

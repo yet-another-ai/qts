@@ -64,7 +64,7 @@ The Vulkan path requires a working Vulkan SDK / loader and `glslc` on the machin
 
 Runtime backend is controlled by **`QWEN3_TTS_BACKEND`** (`auto`, `cpu`, `metal`, `vulkan`). When profiling with Vulkan on macOS (MoltenVK), build with `--features vulkan` and set `QWEN3_TTS_BACKEND=vulkan` for the CLI process.
 
-The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`**. Supported tokens are `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `rocm`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack`, subject to the corresponding Cargo feature being enabled in the binary. On Apple platforms, `auto` prefers CoreML when available. On Windows, `auto` now tries `cuda,nvrtx,tensorrt,directml,cpu`. On Linux and other non-Apple targets, `auto` tries `cuda,nvrtx,tensorrt,cpu`.
+The ONNX vocoder execution provider is controlled separately by **`QWEN3_TTS_VOCODER_EP`**. Supported tokens are `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack`, subject to the corresponding Cargo feature being enabled in the binary. On Apple platforms, `auto` prefers CoreML when available. On Windows, `auto` now tries `cuda,nvrtx,tensorrt,directml,cpu`. On Linux and other non-Apple targets, `auto` tries `cuda,nvrtx,tensorrt,cpu`.
 
 If you expect all of those EPs to be usable in one binary, verify that your ONNX Runtime build actually includes the combination you enabled. With ort’s stock prebuilt downloads, some mixed EP sets require building ORT from source first.
 
