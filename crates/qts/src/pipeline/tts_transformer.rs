@@ -4547,7 +4547,9 @@ fn load_tensor_f32_into_context(
         Err(Qwen3TtsError::MissingTensor(_)) => return Ok(None),
         Err(err) => return Err(err),
     };
-    if file.read_tensor_f32(name).is_err() {
+    // Decide availability based on metadata only: this helper is for tensors
+    // that are actually stored as F32 in the GGUF file.
+    if info.ty != sys::ggml_type_GGML_TYPE_F32 {
         return Ok(None);
     }
     let mut ne = [1i64; 4];

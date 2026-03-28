@@ -63,7 +63,7 @@ fn run_profile(args: Vec<String>) -> Result<()> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         eprintln!(
             "qwen3-tts-cli profile — print per-stage synthesis timings (wall clock)\n\n\
-             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--voice-clone-prompt PATH] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|coreml|directml] [--vocoder-ep-fallback LIST]\n\n\
+             usage:\n  profile --text TEXT [--model-dir DIR] [--runs N] [--out OUT.wav] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--voice-clone-prompt PATH] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|cuda|nvrtx|tensorrt|coreml|directml] [--vocoder-ep-fallback LIST]\n\n\
              CLI flags override environment variables.\n\
              Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
              Default vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\n\
