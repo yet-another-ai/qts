@@ -30,6 +30,32 @@ pub use voice_clone_prompt::{
 use std::time::Instant;
 
 /// User-facing synthesis parameters (stable for future `gdext` bindings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TalkerKvMode {
+    #[default]
+    F16,
+    TurboQuant,
+}
+
+impl TalkerKvMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::TurboQuant => "turboquant",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, Qwen3TtsError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "f16" => Ok(Self::F16),
+            "turboquant" | "turbo" | "q8_0" | "q8" => Ok(Self::TurboQuant),
+            other => Err(Qwen3TtsError::InvalidInput(format!(
+                "unknown talker KV mode '{other}' (expected f16 or turboquant)"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SynthesizeRequest {
     pub text: String,
@@ -48,6 +74,8 @@ pub struct SynthesizeRequest {
     /// vocoder chunks of this many frames in a background thread while the
     /// transformer continues generating. Set to 0 to disable (sequential).
     pub vocoder_chunk_size: usize,
+    /// Experimental talker KV cache storage mode.
+    pub talker_kv_mode: TalkerKvMode,
 }
 
 impl Default for SynthesizeRequest {
@@ -63,6 +91,7 @@ impl Default for SynthesizeRequest {
             language_id: 2050,
             vocoder_thread_count: 4,
             vocoder_chunk_size: 0,
+            talker_kv_mode: TalkerKvMode::F16,
         }
     }
 }
@@ -408,6 +437,7 @@ impl Qwen3TtsEngine {
             &prepared.prepared_inputs.trailing_text_hidden,
             &prepared.prepared_inputs.tts_pad_embed,
             &prepared.prompt_frames,
+            req.talker_kv_mode,
             req.thread_count,
             req.max_audio_frames,
             req.repetition_penalty,
@@ -622,6 +652,7 @@ impl Qwen3TtsEngine {
                 &prepared.prepared_inputs.trailing_text_hidden,
                 &prepared.prepared_inputs.tts_pad_embed,
                 &prepared.prompt_frames,
+                req.talker_kv_mode,
                 thread_count,
                 req.max_audio_frames,
                 req.repetition_penalty,
@@ -810,6 +841,7 @@ impl Qwen3TtsEngine {
                 &prepared.prepared_inputs.trailing_text_hidden,
                 &prepared.prepared_inputs.tts_pad_embed,
                 &prepared.prompt_frames,
+                req.talker_kv_mode,
                 thread_count,
                 req.max_audio_frames,
                 req.repetition_penalty,
@@ -893,5 +925,16 @@ mod tests {
         assert_eq!(r.temperature, 0.9);
         assert_eq!(r.top_k, 50);
         assert_eq!(r.language_id, 2050);
+        assert_eq!(r.talker_kv_mode, TalkerKvMode::F16);
+    }
+
+    #[test]
+    fn talker_kv_mode_parse_accepts_aliases() {
+        assert_eq!(TalkerKvMode::parse("f16").unwrap(), TalkerKvMode::F16);
+        assert_eq!(
+            TalkerKvMode::parse("turboquant").unwrap(),
+            TalkerKvMode::TurboQuant
+        );
+        assert_eq!(TalkerKvMode::parse("q8").unwrap(), TalkerKvMode::TurboQuant);
     }
 }

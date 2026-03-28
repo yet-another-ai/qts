@@ -19,7 +19,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use qts::{
-    Qwen3TtsEngine, Qwen3TtsError, StreamingSynthesizeResult, SynthesizeRequest,
+    Qwen3TtsEngine, Qwen3TtsError, StreamingSynthesizeResult, SynthesizeRequest, TalkerKvMode,
     VoiceClonePromptV2, SAMPLE_RATE_HZ,
 };
 use ratatui::backend::CrosstermBackend;
@@ -235,6 +235,7 @@ struct TuiConfig {
     language_id: i32,
     vocoder_thread_count: usize,
     vocoder_chunk_size: usize,
+    talker_kv_mode: TalkerKvMode,
     runtime_backends: RuntimeBackendOverrides,
 }
 
@@ -252,6 +253,7 @@ impl TuiConfig {
             language_id: 2050,
             vocoder_thread_count: 4,
             vocoder_chunk_size: 4,
+            talker_kv_mode: TalkerKvMode::F16,
             runtime_backends: RuntimeBackendOverrides::default(),
         };
 
@@ -310,6 +312,10 @@ impl TuiConfig {
                 "--chunk-size" => {
                     config.vocoder_chunk_size = parse_value_arg(&args, &mut idx, "--chunk-size")?;
                 }
+                "--talker-kv-mode" => {
+                    config.talker_kv_mode =
+                        TalkerKvMode::parse(&value_arg(&args, &mut idx, "--talker-kv-mode")?)?;
+                }
                 other => bail!("unknown tui argument: {other}"),
             }
         }
@@ -328,6 +334,7 @@ impl TuiConfig {
             self.top_p,
             format_language(self.language_id)
         )];
+        parts.push(format!("talker_kv={}", self.talker_kv_mode.as_str()));
         if let Some(runtime) = self.runtime_backends.describe() {
             parts.push(runtime);
         }
@@ -346,6 +353,7 @@ impl TuiConfig {
             language_id: self.language_id,
             vocoder_thread_count: self.vocoder_thread_count,
             vocoder_chunk_size: self.vocoder_chunk_size,
+            talker_kv_mode: self.talker_kv_mode,
         }
     }
 }
@@ -846,14 +854,15 @@ fn warmup_engine(
 fn print_tui_usage() {
     eprintln!(
         "qwen3-tts-cli tui — interactive terminal mode with direct cpal playback\n\n\
-         usage:\n  tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\n\
+         usage:\n  tui [--model-dir DIR] [--voice-clone-prompt prompt.pb] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [--repetition-penalty F] [--language en|zh|ja | --language-id N] [--vocoder-threads N] [--chunk-size N] [--talker-kv-mode f16|turboquant] [--backend auto|cpu|metal|vulkan] [--backend-fallback LIST] [--vocoder-ep auto|cpu|acl|armnn|azure|cann|coreml|cuda|directml|migraphx|nnapi|nvrtx|onednn|openvino|qnn|rknpu|tensorrt|tvm|vitis|webgpu|xnnpack] [--vocoder-ep-fallback LIST]\n\n\
          CLI flags override environment variables.\n\
          Default transformer auto chain: Apple = metal,vulkan,cpu ; others = vulkan,cpu.\n\
          Default vocoder auto chain: Apple = coreml,cpu ; Windows = cuda,nvrtx,tensorrt,directml,cpu ; Linux/others = cuda,nvrtx,tensorrt,cpu.\n\n\
          The model is loaded once and reused for every input line.\n\
          Press F2 in the TUI to cycle between English, Chinese, and Japanese.\n\
          --chunk-size controls how many codec frames are vocoded per streamed chunk (default 4).\n\
-         Set --chunk-size 0 to disable chunked playback and decode after full synthesis."
+         Set --chunk-size 0 to disable chunked playback and decode after full synthesis.\n\
+         Experimental note: --talker-kv-mode turboquant currently requires the CPU backend."
     );
 }
 

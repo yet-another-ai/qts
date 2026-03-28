@@ -275,6 +275,7 @@ cargo run --release -p qts_cli --no-default-features --features vulkan,directml 
 |---------|-----------|-------------------------|
 | GGML backend | `--backend`, `--backend-fallback` | `QWEN3_TTS_BACKEND`, `QWEN3_TTS_BACKEND_FALLBACK` |
 | ONNX vocoder EP | `--vocoder-ep`, `--vocoder-ep-fallback` | `QWEN3_TTS_VOCODER_EP`, `QWEN3_TTS_VOCODER_EP_FALLBACK` |
+| Experimental talker KV cache | `--talker-kv-mode f16|turboquant` | `QWEN3_TTS_TALKER_KV_MODE` |
 | Multi-GPU adapter index | — | `QWEN3_TTS_GPU_DEVICE` (default `0`; e.g. `Vulkan0`, `MTL0`) |
 
 When using `cargo run -p qts_cli` directly, **Cargo features** (e.g. `--features vulkan` or `--features cuda`) must include the backend / execution provider you select with `QWEN3_TTS_BACKEND` or `QWEN3_TTS_VOCODER_EP`, or init will fail. The vocoder accepts the native ORT EP tokens `cpu`, `acl`, `armnn`, `azure`, `cann`, `coreml`, `cuda`, `directml`, `migraphx`, `nnapi`, `nvrtx`, `onednn`, `openvino`, `qnn`, `rknpu`, `tensorrt`, `tvm`, `vitis`, `webgpu`, and `xnnpack` when the matching feature is enabled.
@@ -295,6 +296,8 @@ QWEN3_TTS_BACKEND=vulkan cargo run --release -p qts_cli --features vulkan -- pro
 
 `profile` prints per-stage timings; `--out run1.wav` keeps audio from the first run.
 
+Experimental note: `--talker-kv-mode turboquant` switches the talker KV cache to a quantized GGML-backed storage path. The first implementation currently targets the CPU backend only and reports talker KV allocation plus KV write-back time in the profile output.
+
 ---
 
 ## Tests and benchmarks
@@ -309,6 +312,8 @@ cargo xtask bench cpu
 cargo xtask bench metal
 cargo xtask bench vulkan
 ```
+
+Set `QWEN3_TTS_BENCH_TALKER_KV_MODE=turboquant` to compare the experimental talker KV cache against the default `f16` path.
 
 Alias definition: [`.cargo/config.toml`](.cargo/config.toml).
 

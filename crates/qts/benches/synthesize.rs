@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use qts::{Qwen3TtsEngine, SynthesizeRequest};
+use qts::{Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode};
 
 struct BenchConfig {
     backend_label: String,
@@ -14,6 +14,7 @@ struct BenchConfig {
     temperature: f32,
     top_k: i32,
     top_p: f32,
+    talker_kv_mode: TalkerKvMode,
 }
 
 impl BenchConfig {
@@ -30,6 +31,10 @@ impl BenchConfig {
             temperature: parse_env("QWEN3_TTS_BENCH_TEMPERATURE", 0.0f32),
             top_k: parse_env("QWEN3_TTS_BENCH_TOP_K", 0i32),
             top_p: parse_env("QWEN3_TTS_BENCH_TOP_P", 1.0f32),
+            talker_kv_mode: env::var("QWEN3_TTS_BENCH_TALKER_KV_MODE")
+                .ok()
+                .map(|value| TalkerKvMode::parse(&value).expect("invalid QWEN3_TTS_BENCH_TALKER_KV_MODE"))
+                .unwrap_or(TalkerKvMode::F16),
         }
     }
 }
@@ -59,6 +64,7 @@ fn bench_synthesize(c: &mut Criterion) {
         temperature: cfg.temperature,
         top_k: cfg.top_k,
         top_p: cfg.top_p,
+        talker_kv_mode: cfg.talker_kv_mode,
         ..Default::default()
     };
 
@@ -67,8 +73,10 @@ fn bench_synthesize(c: &mut Criterion) {
         BenchmarkId::new(
             &cfg.backend_label,
             format!(
-                "threads={} frames={}",
-                cfg.thread_count, cfg.max_audio_frames
+                "threads={} frames={} talker_kv={}",
+                cfg.thread_count,
+                cfg.max_audio_frames,
+                cfg.talker_kv_mode.as_str()
             ),
         ),
         |b| {

@@ -12,7 +12,7 @@ use super::backend::{
     slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::model::GgufFile;
-use crate::Qwen3TtsError;
+use crate::{Qwen3TtsError, TalkerKvMode};
 
 #[derive(Debug, Clone)]
 pub struct TtsTransformerConfig {
@@ -131,6 +131,8 @@ pub struct CodecRolloutSubTimings {
     pub code_pred_total: Duration,
     /// Sum of host-side KV cache write-back (download F32 + convert + upload F16).
     pub kv_writeback: Duration,
+    /// Total bytes reserved for talker K/V cache storage.
+    pub talker_kv_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +157,16 @@ struct StepForwardOutputs {
 #[derive(Debug, Clone)]
 struct CodePredStepOutputs {
     logits: Vec<f32>,
+}
+
+struct KvWritebackTensorDownloads {
+    layer_idx: usize,
+    token_start: usize,
+    n_tokens: usize,
+    k_tensor: *mut sys::ggml_tensor,
+    v_tensor: *mut sys::ggml_tensor,
+    k_data: Vec<f32>,
+    v_data: Vec<f32>,
 }
 
 impl TtsTransformer {
@@ -1302,6 +1314,7 @@ impl TtsTransformer {
         trailing_text_hidden: &[f32],
         tts_pad_embed: &[f32],
         prompt_frames: &[Vec<i32>],
+        talker_kv_mode: TalkerKvMode,
         thread_count: usize,
         max_frames: usize,
         repetition_penalty: f32,
@@ -1341,7 +1354,12 @@ impl TtsTransformer {
         let prefill_len = prefill_embd.len() / hidden_size;
         let trailing_len = trailing_text_hidden.len() / hidden_size;
         let required_ctx = max(256, prefill_len + max_frames + 16);
-        let cache = TalkerKvCache::new(&self.config, required_ctx, self.talker._backends.clone())?;
+        let cache = TalkerKvCache::new(
+            &self.config,
+            required_ctx,
+            self.talker._backends.clone(),
+            talker_kv_mode,
+        )?;
         let code_pred_cache = CodePredKvCache::new(
             &self.config,
             self.config.n_codebooks as usize,
@@ -1382,6 +1400,7 @@ impl TtsTransformer {
                     .collect(),
                 sub_timings: CodecRolloutSubTimings {
                     talker_prefill: talker_prefill_dur,
+                    talker_kv_bytes: cache.total_bytes(),
                     ..Default::default()
                 },
             });
@@ -1493,6 +1512,7 @@ impl TtsTransformer {
                 talker_steps: talker_steps_dur,
                 code_pred_total: code_pred_dur,
                 kv_writeback: kv_writeback_dur,
+                talker_kv_bytes: cache.total_bytes(),
             },
         })
     }
@@ -1506,6 +1526,7 @@ impl TtsTransformer {
         trailing_text_hidden: &[f32],
         tts_pad_embed: &[f32],
         prompt_frames: &[Vec<i32>],
+        talker_kv_mode: TalkerKvMode,
         thread_count: usize,
         max_frames: usize,
         repetition_penalty: f32,
@@ -1547,7 +1568,12 @@ impl TtsTransformer {
         let prefill_len = prefill_embd.len() / hidden_size;
         let trailing_len = trailing_text_hidden.len() / hidden_size;
         let required_ctx = max(256, prefill_len + max_frames + 16);
-        let cache = TalkerKvCache::new(&self.config, required_ctx, self.talker._backends.clone())?;
+        let cache = TalkerKvCache::new(
+            &self.config,
+            required_ctx,
+            self.talker._backends.clone(),
+            talker_kv_mode,
+        )?;
         let code_pred_cache = CodePredKvCache::new(
             &self.config,
             self.config.n_codebooks as usize,
@@ -1588,6 +1614,7 @@ impl TtsTransformer {
                     .collect(),
                 sub_timings: CodecRolloutSubTimings {
                     talker_prefill: talker_prefill_dur,
+                    talker_kv_bytes: cache.total_bytes(),
                     ..Default::default()
                 },
             });
@@ -1731,6 +1758,7 @@ impl TtsTransformer {
                 talker_steps: talker_steps_dur,
                 code_pred_total: code_pred_dur,
                 kv_writeback: kv_writeback_dur,
+                talker_kv_bytes: cache.total_bytes(),
             },
         })
     }
@@ -2972,6 +3000,7 @@ impl TtsTransformer {
         let mut inp_l = inp_prefill_embd.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
+        let mut kv_writeback = Vec::<KvWritebackTensorDownloads>::new();
 
         for (layer_idx, layer) in self.talker.layers.iter().enumerate() {
             let mut cur =
@@ -3056,41 +3085,65 @@ impl TtsTransformer {
                 )
             };
 
-            let k_cache = cache.k_cache[layer_idx].as_ptr();
-            let v_cache = cache.v_cache[layer_idx].as_ptr();
-            let k_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    k_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_tokens as i64,
-                    (*k_cache).nb[1],
-                    (*k_cache).nb[2],
-                    0,
-                )
-            };
-            let v_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    v_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_tokens as i64,
-                    (*v_cache).nb[1],
-                    (*v_cache).nb[2],
-                    0,
-                )
-            };
-            unsafe {
-                sys::ggml_build_forward_expand(
-                    graph.as_ptr(),
-                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
-                );
-                sys::ggml_build_forward_expand(
-                    graph.as_ptr(),
-                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
-                );
+            match cache.storage() {
+                TalkerKvStorage::F16 => {
+                    let k_cache = cache.k_cache[layer_idx].as_ptr();
+                    let v_cache = cache.v_cache[layer_idx].as_ptr();
+                    let k_cache_view = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            k_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            n_tokens as i64,
+                            (*k_cache).nb[1],
+                            (*k_cache).nb[2],
+                            0,
+                        )
+                    };
+                    let v_cache_view = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            v_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            n_tokens as i64,
+                            (*v_cache).nb[1],
+                            (*v_cache).nb[2],
+                            0,
+                        )
+                    };
+                    unsafe {
+                        sys::ggml_build_forward_expand(
+                            graph.as_ptr(),
+                            sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                        );
+                        sys::ggml_build_forward_expand(
+                            graph.as_ptr(),
+                            sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                        );
+                    }
+                }
+                TalkerKvStorage::TurboQuantQ8_0 => {
+                    let k_store = unsafe { sys::ggml_cont(ctx.as_ptr(), k_cur) };
+                    let v_store = unsafe { sys::ggml_cont(ctx.as_ptr(), v_cur) };
+                    unsafe {
+                        sys::ggml_build_forward_expand(graph.as_ptr(), k_store);
+                        sys::ggml_build_forward_expand(graph.as_ptr(), v_store);
+                    }
+                    let rows = self.config.n_key_value_heads as usize
+                        * n_tokens
+                        * self.config.head_dim as usize;
+                    kv_writeback.push(KvWritebackTensorDownloads {
+                        layer_idx,
+                        token_start: 0,
+                        n_tokens,
+                        k_tensor: k_store,
+                        v_tensor: v_store,
+                        k_data: vec![0.0; rows],
+                        v_data: vec![0.0; rows],
+                    });
+                }
             }
 
             let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
@@ -3187,23 +3240,49 @@ impl TtsTransformer {
                 bytes: slice_as_bytes(data.as_slice()),
             });
         }
+        let mut downloads = vec![
+            TensorDownload {
+                tensor: last_hidden,
+                bytes: slice_as_bytes_mut(hidden_data.as_mut_slice()),
+            },
+            TensorDownload {
+                tensor: logits,
+                bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
+            },
+        ];
+        for pending in &mut kv_writeback {
+            downloads.push(TensorDownload {
+                tensor: pending.k_tensor,
+                bytes: slice_as_bytes_mut(pending.k_data.as_mut_slice()),
+            });
+            downloads.push(TensorDownload {
+                tensor: pending.v_tensor,
+                bytes: slice_as_bytes_mut(pending.v_data.as_mut_slice()),
+            });
+        }
         execute_graph(
             &cache._backends,
             graph,
             uploads.as_slice(),
-            &mut [
-                TensorDownload {
-                    tensor: last_hidden,
-                    bytes: slice_as_bytes_mut(hidden_data.as_mut_slice()),
-                },
-                TensorDownload {
-                    tensor: logits,
-                    bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
-                },
-            ],
+            downloads.as_mut_slice(),
             thread_count,
             "cached prefill graph execution failed",
         )?;
+        if cache.storage().is_quantized() {
+            let rows_per_token = self.config.n_key_value_heads as usize;
+            let row_len = self.config.head_dim as usize;
+            for pending in kv_writeback {
+                cache.quantized_write_layer(
+                    pending.layer_idx,
+                    pending.token_start,
+                    pending.n_tokens,
+                    rows_per_token,
+                    row_len,
+                    pending.k_data.as_slice(),
+                    pending.v_data.as_slice(),
+                )?;
+            }
+        }
 
         Ok(StepForwardOutputs {
             hidden_state: hidden_data,
@@ -3259,6 +3338,7 @@ impl TtsTransformer {
         let mut inp_l = inp_step.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
+        let mut kv_writeback = Vec::<KvWritebackTensorDownloads>::new();
         for (layer_idx, layer) in self.talker.layers.iter().enumerate() {
             let mut cur =
                 unsafe { sys::ggml_rms_norm(ctx.as_ptr(), inp_l, self.config.rms_norm_eps) };
@@ -3344,65 +3424,125 @@ impl TtsTransformer {
 
             let k_cache = cache.k_cache[layer_idx].as_ptr();
             let v_cache = cache.v_cache[layer_idx].as_ptr();
-            let k_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    k_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    1,
-                    (*k_cache).nb[1],
-                    (*k_cache).nb[2],
-                    n_past * (*k_cache).nb[2],
-                )
-            };
-            let v_cache_view = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    v_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    1,
-                    (*v_cache).nb[1],
-                    (*v_cache).nb[2],
-                    n_past * (*v_cache).nb[2],
-                )
-            };
-            unsafe {
-                sys::ggml_build_forward_expand(
-                    graph.as_ptr(),
-                    sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
-                );
-                sys::ggml_build_forward_expand(
-                    graph.as_ptr(),
-                    sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
-                );
-            }
+            let (mut k, mut v) = match cache.storage() {
+                TalkerKvStorage::F16 => {
+                    let k_cache_view = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            k_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            1,
+                            (*k_cache).nb[1],
+                            (*k_cache).nb[2],
+                            n_past * (*k_cache).nb[2],
+                        )
+                    };
+                    let v_cache_view = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            v_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            1,
+                            (*v_cache).nb[1],
+                            (*v_cache).nb[2],
+                            n_past * (*v_cache).nb[2],
+                        )
+                    };
+                    unsafe {
+                        sys::ggml_build_forward_expand(
+                            graph.as_ptr(),
+                            sys::ggml_cpy(ctx.as_ptr(), k_cur, k_cache_view),
+                        );
+                        sys::ggml_build_forward_expand(
+                            graph.as_ptr(),
+                            sys::ggml_cpy(ctx.as_ptr(), v_cur, v_cache_view),
+                        );
+                    }
 
-            let n_kv = n_past + 1;
-            let mut k = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    k_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_kv as i64,
-                    (*k_cache).nb[1],
-                    (*k_cache).nb[2],
-                    0,
-                )
-            };
-            let mut v = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    v_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_kv as i64,
-                    (*v_cache).nb[1],
-                    (*v_cache).nb[2],
-                    0,
-                )
+                    let n_kv = n_past + 1;
+                    let k = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            k_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            n_kv as i64,
+                            (*k_cache).nb[1],
+                            (*k_cache).nb[2],
+                            0,
+                        )
+                    };
+                    let v = unsafe {
+                        sys::ggml_view_3d(
+                            ctx.as_ptr(),
+                            v_cache,
+                            self.config.head_dim as i64,
+                            self.config.n_key_value_heads as i64,
+                            n_kv as i64,
+                            (*v_cache).nb[1],
+                            (*v_cache).nb[2],
+                            0,
+                        )
+                    };
+                    (k, v)
+                }
+                TalkerKvStorage::TurboQuantQ8_0 => {
+                    let k_store = unsafe { sys::ggml_cont(ctx.as_ptr(), k_cur) };
+                    let v_store = unsafe { sys::ggml_cont(ctx.as_ptr(), v_cur) };
+                    unsafe {
+                        sys::ggml_build_forward_expand(graph.as_ptr(), k_store);
+                        sys::ggml_build_forward_expand(graph.as_ptr(), v_store);
+                    }
+                    let rows = self.config.n_key_value_heads as usize * self.config.head_dim as usize;
+                    kv_writeback.push(KvWritebackTensorDownloads {
+                        layer_idx,
+                        token_start: n_past,
+                        n_tokens: 1,
+                        k_tensor: k_store,
+                        v_tensor: v_store,
+                        k_data: vec![0.0; rows],
+                        v_data: vec![0.0; rows],
+                    });
+                    if n_past == 0 {
+                        (k_cur, v_cur)
+                    } else {
+                        let k_prefix_q = unsafe {
+                            sys::ggml_view_3d(
+                                ctx.as_ptr(),
+                                k_cache,
+                                self.config.head_dim as i64,
+                                self.config.n_key_value_heads as i64,
+                                n_past as i64,
+                                (*k_cache).nb[1],
+                                (*k_cache).nb[2],
+                                0,
+                            )
+                        };
+                        let v_prefix_q = unsafe {
+                            sys::ggml_view_3d(
+                                ctx.as_ptr(),
+                                v_cache,
+                                self.config.head_dim as i64,
+                                self.config.n_key_value_heads as i64,
+                                n_past as i64,
+                                (*v_cache).nb[1],
+                                (*v_cache).nb[2],
+                                0,
+                            )
+                        };
+                        let k_prefix = unsafe {
+                            sys::ggml_cast(ctx.as_ptr(), k_prefix_q, sys::ggml_type_GGML_TYPE_F32)
+                        };
+                        let v_prefix = unsafe {
+                            sys::ggml_cast(ctx.as_ptr(), v_prefix_q, sys::ggml_type_GGML_TYPE_F32)
+                        };
+                        let k = unsafe { sys::ggml_concat(ctx.as_ptr(), k_prefix, k_cur, 2) };
+                        let v = unsafe { sys::ggml_concat(ctx.as_ptr(), v_prefix, v_cur, 2) };
+                        (k, v)
+                    }
+                }
             };
 
             let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
@@ -3486,27 +3626,57 @@ impl TtsTransformer {
                 bytes: slice_as_bytes(data.as_slice()),
             });
         }
+        let mut downloads = vec![
+            TensorDownload {
+                tensor: hidden_state,
+                bytes: slice_as_bytes_mut(hidden.as_mut_slice()),
+            },
+            TensorDownload {
+                tensor: logits,
+                bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
+            },
+        ];
+        for pending in &mut kv_writeback {
+            downloads.push(TensorDownload {
+                tensor: pending.k_tensor,
+                bytes: slice_as_bytes_mut(pending.k_data.as_mut_slice()),
+            });
+            downloads.push(TensorDownload {
+                tensor: pending.v_tensor,
+                bytes: slice_as_bytes_mut(pending.v_data.as_mut_slice()),
+            });
+        }
         execute_graph(
             &cache._backends,
             graph,
             uploads.as_slice(),
-            &mut [
-                TensorDownload {
-                    tensor: hidden_state,
-                    bytes: slice_as_bytes_mut(hidden.as_mut_slice()),
-                },
-                TensorDownload {
-                    tensor: logits,
-                    bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
-                },
-            ],
+            downloads.as_mut_slice(),
             thread_count,
             "step graph execution failed",
         )?;
+        let kv_writeback_elapsed = if cache.storage().is_quantized() {
+            let t_writeback = Instant::now();
+            let rows_per_token = self.config.n_key_value_heads as usize;
+            let row_len = self.config.head_dim as usize;
+            for pending in kv_writeback {
+                cache.quantized_write_layer(
+                    pending.layer_idx,
+                    pending.token_start,
+                    pending.n_tokens,
+                    rows_per_token,
+                    row_len,
+                    pending.k_data.as_slice(),
+                    pending.v_data.as_slice(),
+                )?;
+            }
+            t_writeback.elapsed()
+        } else {
+            Duration::ZERO
+        };
         Ok(StepForwardOutputs {
             hidden_state: hidden,
             logits: logits_data,
-            kv_writeback_elapsed: Duration::ZERO,
+            kv_writeback_elapsed,
         })
     }
 }
@@ -3740,6 +3910,7 @@ struct TalkerKvCache {
     _buffer: OwnedBuffer,
     k_cache: Vec<NonNull<sys::ggml_tensor>>,
     v_cache: Vec<NonNull<sys::ggml_tensor>>,
+    storage: TalkerKvStorage,
     n_ctx: usize,
 }
 
@@ -3752,14 +3923,47 @@ struct CodePredKvCache {
     n_ctx: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TalkerKvStorage {
+    F16,
+    TurboQuantQ8_0,
+}
+
+impl TalkerKvStorage {
+    fn from_mode(mode: TalkerKvMode) -> Self {
+        match mode {
+            TalkerKvMode::F16 => Self::F16,
+            TalkerKvMode::TurboQuant => Self::TurboQuantQ8_0,
+        }
+    }
+
+    fn tensor_type(self) -> sys::ggml_type {
+        match self {
+            Self::F16 => sys::ggml_type_GGML_TYPE_F16,
+            Self::TurboQuantQ8_0 => sys::ggml_type_GGML_TYPE_Q8_0,
+        }
+    }
+
+    fn is_quantized(self) -> bool {
+        matches!(self, Self::TurboQuantQ8_0)
+    }
+}
+
 impl TalkerKvCache {
     fn new(
         cfg: &TtsTransformerConfig,
         n_ctx: usize,
         backends: BackendSet,
+        mode: TalkerKvMode,
     ) -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_cpu_init();
+        }
+        let storage = TalkerKvStorage::from_mode(mode);
+        if storage.is_quantized() && backends.primary_kind() != BackendKind::Cpu {
+            return Err(Qwen3TtsError::InvalidInput(
+                "experimental turboquant talker KV currently requires the CPU backend".into(),
+            ));
         }
         let ctx = OwnedContext::new_for_tensor_metadata(cfg.n_layers as usize * 2)?;
         let mut k_cache = Vec::with_capacity(cfg.n_layers as usize);
@@ -3768,7 +3972,7 @@ impl TalkerKvCache {
             let k = unsafe {
                 sys::ggml_new_tensor_3d(
                     ctx.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F16,
+                    storage.tensor_type(),
                     cfg.head_dim as i64,
                     cfg.n_key_value_heads as i64,
                     n_ctx as i64,
@@ -3777,7 +3981,7 @@ impl TalkerKvCache {
             let v = unsafe {
                 sys::ggml_new_tensor_3d(
                     ctx.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F16,
+                    storage.tensor_type(),
                     cfg.head_dim as i64,
                     cfg.n_key_value_heads as i64,
                     n_ctx as i64,
@@ -3811,9 +4015,113 @@ impl TalkerKvCache {
             _buffer: buffer,
             k_cache,
             v_cache,
+            storage,
             n_ctx,
         })
     }
+
+    fn storage(&self) -> TalkerKvStorage {
+        self.storage
+    }
+
+    fn total_bytes(&self) -> usize {
+        let per_tensor = self
+            .k_cache
+            .first()
+            .map(|tensor| unsafe { sys::ggml_nbytes(tensor.as_ptr()) })
+            .unwrap_or(0);
+        per_tensor.saturating_mul(self.k_cache.len() + self.v_cache.len())
+    }
+
+    fn quantized_write_layer(
+        &self,
+        layer_idx: usize,
+        token_start: usize,
+        n_tokens: usize,
+        rows_per_token: usize,
+        row_len: usize,
+        k_src: &[f32],
+        v_src: &[f32],
+    ) -> Result<(), Qwen3TtsError> {
+        debug_assert!(self.storage.is_quantized());
+        let k = self
+            .k_cache
+            .get(layer_idx)
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("talker K cache layer out of range".into()))?;
+        let v = self
+            .v_cache
+            .get(layer_idx)
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("talker V cache layer out of range".into()))?;
+        quantized_tensor_write_rows(
+            k.as_ptr(),
+            self.storage.tensor_type(),
+            token_start,
+            n_tokens,
+            rows_per_token,
+            row_len,
+            k_src,
+        )?;
+        quantized_tensor_write_rows(
+            v.as_ptr(),
+            self.storage.tensor_type(),
+            token_start,
+            n_tokens,
+            rows_per_token,
+            row_len,
+            v_src,
+        )?;
+        Ok(())
+    }
+}
+
+fn quantized_tensor_write_rows(
+    tensor: *mut sys::ggml_tensor,
+    quant_type: sys::ggml_type,
+    token_start: usize,
+    n_tokens: usize,
+    rows_per_token: usize,
+    row_len: usize,
+    src: &[f32],
+) -> Result<(), Qwen3TtsError> {
+    if src.len() != n_tokens.saturating_mul(rows_per_token).saturating_mul(row_len) {
+        return Err(Qwen3TtsError::InvalidInput(
+            "quantized KV source rows had an unexpected size".into(),
+        ));
+    }
+    let block_size = unsafe { sys::ggml_blck_size(quant_type) as usize };
+    if block_size == 0 || !row_len.is_multiple_of(block_size) {
+        return Err(Qwen3TtsError::InvalidInput(format!(
+            "quantized KV row length {row_len} is incompatible with block size {block_size}"
+        )));
+    }
+    let type_size = unsafe { sys::ggml_type_size(quant_type) };
+    let bytes_per_row = row_len / block_size * type_size;
+    let total_bytes = n_tokens
+        .saturating_mul(rows_per_token)
+        .saturating_mul(bytes_per_row);
+    let mut quantized = vec![0u8; total_bytes];
+    let written = unsafe {
+        sys::ggml_quantize_chunk(
+            quant_type,
+            src.as_ptr(),
+            quantized.as_mut_ptr().cast(),
+            0,
+            (n_tokens * rows_per_token) as i64,
+            row_len as i64,
+            std::ptr::null(),
+        )
+    };
+    if written != quantized.len() {
+        return Err(Qwen3TtsError::InvalidInput(format!(
+            "quantized KV write produced {written} bytes, expected {}",
+            quantized.len()
+        )));
+    }
+    let offset = unsafe { token_start * (*tensor).nb[2] };
+    unsafe {
+        sys::ggml_backend_tensor_set(tensor, quantized.as_ptr().cast(), offset, quantized.len());
+    }
+    Ok(())
 }
 
 impl CodePredKvCache {

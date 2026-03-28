@@ -82,6 +82,7 @@ impl SynthesisStageTimings {
                 talker_steps: avg(|s| s.codec_rollout_detail.talker_steps),
                 code_pred_total: avg(|s| s.codec_rollout_detail.code_pred_total),
                 kv_writeback: avg(|s| s.codec_rollout_detail.kv_writeback),
+                talker_kv_bytes: avg_usize(|s| s.codec_rollout_detail.talker_kv_bytes),
             },
             generated_samples: avg_usize(|s| s.generated_samples),
             sample_rate_hz: samples[0].sample_rate_hz,
@@ -124,7 +125,8 @@ impl SynthesisStageTimings {
         let has_detail = !d.talker_prefill.is_zero()
             || !d.talker_steps.is_zero()
             || !d.code_pred_total.is_zero()
-            || !d.kv_writeback.is_zero();
+            || !d.kv_writeback.is_zero()
+            || d.talker_kv_bytes > 0;
         if has_detail {
             let sub_rows: [(&str, Duration); 4] = [
                 ("  talker_prefill", d.talker_prefill),
@@ -134,6 +136,10 @@ impl SynthesisStageTimings {
             ];
             for (name, sd) in sub_rows {
                 let _ = writeln!(out, "    {name:<26} {:>10.3} ms", duration_ms(sd));
+            }
+            if d.talker_kv_bytes > 0 {
+                let mib = d.talker_kv_bytes as f64 / (1024.0 * 1024.0);
+                let _ = writeln!(out, "    {:<26} {:>10.3} MiB", "talker_kv_bytes", mib);
             }
         }
         if !self.pipeline_overlap.is_zero() {

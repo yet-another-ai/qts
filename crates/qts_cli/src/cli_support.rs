@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use qts::{Qwen3TtsEngine, SynthesizeRequest};
+use qts::{Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeBackendOverrides {
@@ -83,6 +83,7 @@ pub(crate) struct CommonSynthesisArgs {
     pub(crate) language_id: i32,
     pub(crate) vocoder_thread_count: usize,
     pub(crate) vocoder_chunk_size: usize,
+    pub(crate) talker_kv_mode: TalkerKvMode,
     pub(crate) runtime_backends: RuntimeBackendOverrides,
 }
 
@@ -102,6 +103,7 @@ impl CommonSynthesisArgs {
             language_id: 2050,
             vocoder_thread_count: 4,
             vocoder_chunk_size: 0,
+            talker_kv_mode: parse_talker_kv_mode_env()?,
             runtime_backends: RuntimeBackendOverrides::default(),
         })
     }
@@ -164,6 +166,10 @@ impl CommonSynthesisArgs {
                 self.vocoder_chunk_size = parse_value_arg(args, idx, "--chunk-size")?;
                 Ok(true)
             }
+            "--talker-kv-mode" => {
+                self.talker_kv_mode = TalkerKvMode::parse(&value_arg(args, idx, "--talker-kv-mode")?)?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -193,7 +199,15 @@ impl CommonSynthesisArgs {
             language_id: self.language_id,
             vocoder_thread_count: self.vocoder_thread_count,
             vocoder_chunk_size: self.vocoder_chunk_size,
+            talker_kv_mode: self.talker_kv_mode,
         })
+    }
+}
+
+fn parse_talker_kv_mode_env() -> Result<TalkerKvMode> {
+    match env::var("QWEN3_TTS_TALKER_KV_MODE") {
+        Ok(value) if !value.trim().is_empty() => Ok(TalkerKvMode::parse(&value)?),
+        _ => Ok(TalkerKvMode::F16),
     }
 }
 

@@ -87,6 +87,10 @@ The table is intentionally **feature-first** so a future backend can list multip
 
 For ONNX Runtime features, remember that Cargo features alone do not guarantee a matching prebuilt ORT binary exists. ort documents prebuilt bundles for platform-native EPs like `directml`, `xnnpack`, and `coreml`, plus separate bundles for `cuda` + `tensorrt`, `webgpu`, and `nvrtx`. If you combine EP families outside those bundles, you may need to compile ONNX Runtime from source to avoid falling back to a CPU-only runtime.
 
+Experimental runtime knobs:
+- `QWEN3_TTS_TALKER_KV_MODE=f16|turboquant` switches the talker KV cache path at runtime.
+- `turboquant` currently targets the CPU backend only and uses quantized GGML storage for the talker KV cache.
+
 ## Vulkan prerequisites
 
 - Linux: install a Vulkan loader / headers plus `glslc` before building `--features vulkan`. If you enable `blas`, install a BLAS implementation (e.g. OpenBLAS) and set `GGML_BLAS_VENDOR` / `BLA_VENDOR` as needed for CMake.
