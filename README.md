@@ -296,7 +296,7 @@ QWEN3_TTS_BACKEND=vulkan cargo run --release -p qts_cli --features vulkan -- pro
 
 `profile` prints per-stage timings; `--out run1.wav` keeps audio from the first run.
 
-Experimental note: `--talker-kv-mode turboquant` switches the talker KV cache to a quantized GGML-backed storage path. The first implementation currently targets the CPU backend only and reports talker KV allocation plus KV write-back time in the profile output.
+Experimental note: `--talker-kv-mode turboquant` switches the talker KV cache to a quantized GGML-backed storage path. The cache itself now lives on the selected backend, while host-side quantization and upload are still part of the write-back path. `profile` reports talker KV allocation plus `kv_download`, `kv_quantize`, and `kv_upload` timing buckets.
 
 ---
 

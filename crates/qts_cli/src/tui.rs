@@ -862,7 +862,7 @@ fn print_tui_usage() {
          Press F2 in the TUI to cycle between English, Chinese, and Japanese.\n\
          --chunk-size controls how many codec frames are vocoded per streamed chunk (default 4).\n\
          Set --chunk-size 0 to disable chunked playback and decode after full synthesis.\n\
-         Experimental note: --talker-kv-mode turboquant currently requires the CPU backend."
+         Experimental note: --talker-kv-mode turboquant keeps the KV cache on the selected backend, but quantizes on the host before upload."
     );
 }
 

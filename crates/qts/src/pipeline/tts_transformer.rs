@@ -129,8 +129,14 @@ pub struct CodecRolloutSubTimings {
     pub talker_steps: Duration,
     /// Sum of code-predictor forward passes (prefill + per-codebook steps, all frames).
     pub code_pred_total: Duration,
-    /// Sum of host-side KV cache write-back (download F32 + convert + upload F16).
+    /// Sum of host-side KV cache write-back (download + quantize + upload).
     pub kv_writeback: Duration,
+    /// Sum of host-side KV downloads prior to quantization.
+    pub kv_download: Duration,
+    /// Sum of host-side quantization time for talker K/V rows.
+    pub kv_quantize: Duration,
+    /// Sum of cache uploads after host quantization.
+    pub kv_upload: Duration,
     /// Total bytes reserved for talker K/V cache storage.
     pub talker_kv_bytes: usize,
 }
@@ -152,6 +158,9 @@ struct StepForwardOutputs {
     hidden_state: Vec<f32>,
     logits: Vec<f32>,
     kv_writeback_elapsed: Duration,
+    kv_download_elapsed: Duration,
+    kv_quantize_elapsed: Duration,
+    kv_upload_elapsed: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1439,6 +1448,9 @@ impl TtsTransformer {
 
         let mut talker_steps_dur = Duration::ZERO;
         let mut kv_writeback_dur = Duration::ZERO;
+        let mut kv_download_dur = Duration::ZERO;
+        let mut kv_quantize_dur = Duration::ZERO;
+        let mut kv_upload_dur = Duration::ZERO;
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
@@ -1464,6 +1476,9 @@ impl TtsTransformer {
                 self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
             let step_elapsed = t_step.elapsed();
             kv_writeback_dur += step_outputs.kv_writeback_elapsed;
+            kv_download_dur += step_outputs.kv_download_elapsed;
+            kv_quantize_dur += step_outputs.kv_quantize_elapsed;
+            kv_upload_dur += step_outputs.kv_upload_elapsed;
             talker_steps_dur += step_elapsed.saturating_sub(step_outputs.kv_writeback_elapsed);
 
             let mut logits = step_outputs.logits;
@@ -1512,6 +1527,9 @@ impl TtsTransformer {
                 talker_steps: talker_steps_dur,
                 code_pred_total: code_pred_dur,
                 kv_writeback: kv_writeback_dur,
+                kv_download: kv_download_dur,
+                kv_quantize: kv_quantize_dur,
+                kv_upload: kv_upload_dur,
                 talker_kv_bytes: cache.total_bytes(),
             },
         })
@@ -1675,6 +1693,9 @@ impl TtsTransformer {
 
         let mut talker_steps_dur = Duration::ZERO;
         let mut kv_writeback_dur = Duration::ZERO;
+        let mut kv_download_dur = Duration::ZERO;
+        let mut kv_quantize_dur = Duration::ZERO;
+        let mut kv_upload_dur = Duration::ZERO;
 
         while frames.len() < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
@@ -1700,6 +1721,9 @@ impl TtsTransformer {
                 self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
             let step_elapsed = t_step.elapsed();
             kv_writeback_dur += step_outputs.kv_writeback_elapsed;
+            kv_download_dur += step_outputs.kv_download_elapsed;
+            kv_quantize_dur += step_outputs.kv_quantize_elapsed;
+            kv_upload_dur += step_outputs.kv_upload_elapsed;
             talker_steps_dur += step_elapsed.saturating_sub(step_outputs.kv_writeback_elapsed);
 
             let mut logits = step_outputs.logits;
@@ -1758,6 +1782,9 @@ impl TtsTransformer {
                 talker_steps: talker_steps_dur,
                 code_pred_total: code_pred_dur,
                 kv_writeback: kv_writeback_dur,
+                kv_download: kv_download_dur,
+                kv_quantize: kv_quantize_dur,
+                kv_upload: kv_upload_dur,
                 talker_kv_bytes: cache.total_bytes(),
             },
         })
@@ -3250,16 +3277,6 @@ impl TtsTransformer {
                 bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
             },
         ];
-        for pending in &mut kv_writeback {
-            downloads.push(TensorDownload {
-                tensor: pending.k_tensor,
-                bytes: slice_as_bytes_mut(pending.k_data.as_mut_slice()),
-            });
-            downloads.push(TensorDownload {
-                tensor: pending.v_tensor,
-                bytes: slice_as_bytes_mut(pending.v_data.as_mut_slice()),
-            });
-        }
         execute_graph(
             &cache._backends,
             graph,
@@ -3271,8 +3288,22 @@ impl TtsTransformer {
         if cache.storage().is_quantized() {
             let rows_per_token = self.config.n_key_value_heads as usize;
             let row_len = self.config.head_dim as usize;
-            for pending in kv_writeback {
-                cache.quantized_write_layer(
+            for mut pending in kv_writeback {
+                unsafe {
+                    sys::ggml_backend_tensor_get(
+                        pending.k_tensor,
+                        pending.k_data.as_mut_ptr().cast(),
+                        0,
+                        std::mem::size_of_val(pending.k_data.as_slice()),
+                    );
+                    sys::ggml_backend_tensor_get(
+                        pending.v_tensor,
+                        pending.v_data.as_mut_ptr().cast(),
+                        0,
+                        std::mem::size_of_val(pending.v_data.as_slice()),
+                    );
+                }
+                let _ = cache.quantized_write_layer(
                     pending.layer_idx,
                     pending.token_start,
                     pending.n_tokens,
@@ -3288,6 +3319,9 @@ impl TtsTransformer {
             hidden_state: hidden_data,
             logits: logits_data,
             kv_writeback_elapsed: Duration::ZERO,
+            kv_download_elapsed: Duration::ZERO,
+            kv_quantize_elapsed: Duration::ZERO,
+            kv_upload_elapsed: Duration::ZERO,
         })
     }
 
@@ -3636,16 +3670,6 @@ impl TtsTransformer {
                 bytes: slice_as_bytes_mut(logits_data.as_mut_slice()),
             },
         ];
-        for pending in &mut kv_writeback {
-            downloads.push(TensorDownload {
-                tensor: pending.k_tensor,
-                bytes: slice_as_bytes_mut(pending.k_data.as_mut_slice()),
-            });
-            downloads.push(TensorDownload {
-                tensor: pending.v_tensor,
-                bytes: slice_as_bytes_mut(pending.v_data.as_mut_slice()),
-            });
-        }
         execute_graph(
             &cache._backends,
             graph,
@@ -3654,29 +3678,61 @@ impl TtsTransformer {
             thread_count,
             "step graph execution failed",
         )?;
-        let kv_writeback_elapsed = if cache.storage().is_quantized() {
-            let t_writeback = Instant::now();
-            let rows_per_token = self.config.n_key_value_heads as usize;
-            let row_len = self.config.head_dim as usize;
-            for pending in kv_writeback {
-                cache.quantized_write_layer(
-                    pending.layer_idx,
-                    pending.token_start,
-                    pending.n_tokens,
-                    rows_per_token,
-                    row_len,
-                    pending.k_data.as_slice(),
-                    pending.v_data.as_slice(),
-                )?;
-            }
-            t_writeback.elapsed()
-        } else {
-            Duration::ZERO
-        };
+        let (kv_writeback_elapsed, kv_download_elapsed, kv_quantize_elapsed, kv_upload_elapsed) =
+            if cache.storage().is_quantized() {
+                let t_writeback = Instant::now();
+                let t_download = Instant::now();
+                for pending in &mut kv_writeback {
+                    unsafe {
+                        sys::ggml_backend_tensor_get(
+                            pending.k_tensor,
+                            pending.k_data.as_mut_ptr().cast(),
+                            0,
+                            std::mem::size_of_val(pending.k_data.as_slice()),
+                        );
+                        sys::ggml_backend_tensor_get(
+                            pending.v_tensor,
+                            pending.v_data.as_mut_ptr().cast(),
+                            0,
+                            std::mem::size_of_val(pending.v_data.as_slice()),
+                        );
+                    }
+                }
+                let download_elapsed = t_download.elapsed();
+                let mut quantize_elapsed = Duration::ZERO;
+                let mut upload_elapsed = Duration::ZERO;
+                let rows_per_token = self.config.n_key_value_heads as usize;
+                let row_len = self.config.head_dim as usize;
+                for pending in kv_writeback {
+                    let (quantize, upload) = cache.quantized_write_layer(
+                        pending.layer_idx,
+                        pending.token_start,
+                        pending.n_tokens,
+                        rows_per_token,
+                        row_len,
+                        pending.k_data.as_slice(),
+                        pending.v_data.as_slice(),
+                    )?;
+                    quantize_elapsed += quantize;
+                    upload_elapsed += upload;
+                }
+                let total = t_writeback.elapsed();
+                (total, download_elapsed, quantize_elapsed, upload_elapsed)
+            } else {
+                (
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+            };
         Ok(StepForwardOutputs {
             hidden_state: hidden,
             logits: logits_data,
             kv_writeback_elapsed,
+            kv_download_elapsed,
+            kv_quantize_elapsed,
+            kv_upload_elapsed,
         })
     }
 }
@@ -3960,11 +4016,6 @@ impl TalkerKvCache {
             sys::ggml_cpu_init();
         }
         let storage = TalkerKvStorage::from_mode(mode);
-        if storage.is_quantized() && backends.primary_kind() != BackendKind::Cpu {
-            return Err(Qwen3TtsError::InvalidInput(
-                "experimental turboquant talker KV currently requires the CPU backend".into(),
-            ));
-        }
         let ctx = OwnedContext::new_for_tensor_metadata(cfg.n_layers as usize * 2)?;
         let mut k_cache = Vec::with_capacity(cfg.n_layers as usize);
         let mut v_cache = Vec::with_capacity(cfg.n_layers as usize);
@@ -4042,7 +4093,7 @@ impl TalkerKvCache {
         row_len: usize,
         k_src: &[f32],
         v_src: &[f32],
-    ) -> Result<(), Qwen3TtsError> {
+    ) -> Result<(Duration, Duration), Qwen3TtsError> {
         debug_assert!(self.storage.is_quantized());
         let k = self
             .k_cache
@@ -4052,7 +4103,7 @@ impl TalkerKvCache {
             .v_cache
             .get(layer_idx)
             .ok_or_else(|| Qwen3TtsError::InvalidInput("talker V cache layer out of range".into()))?;
-        quantized_tensor_write_rows(
+        let (k_quantize, k_upload) = quantized_tensor_write_rows(
             k.as_ptr(),
             self.storage.tensor_type(),
             token_start,
@@ -4061,7 +4112,7 @@ impl TalkerKvCache {
             row_len,
             k_src,
         )?;
-        quantized_tensor_write_rows(
+        let (v_quantize, v_upload) = quantized_tensor_write_rows(
             v.as_ptr(),
             self.storage.tensor_type(),
             token_start,
@@ -4070,7 +4121,7 @@ impl TalkerKvCache {
             row_len,
             v_src,
         )?;
-        Ok(())
+        Ok((k_quantize + v_quantize, k_upload + v_upload))
     }
 }
 
@@ -4082,7 +4133,7 @@ fn quantized_tensor_write_rows(
     rows_per_token: usize,
     row_len: usize,
     src: &[f32],
-) -> Result<(), Qwen3TtsError> {
+) -> Result<(Duration, Duration), Qwen3TtsError> {
     if src.len() != n_tokens.saturating_mul(rows_per_token).saturating_mul(row_len) {
         return Err(Qwen3TtsError::InvalidInput(
             "quantized KV source rows had an unexpected size".into(),
@@ -4100,6 +4151,7 @@ fn quantized_tensor_write_rows(
         .saturating_mul(rows_per_token)
         .saturating_mul(bytes_per_row);
     let mut quantized = vec![0u8; total_bytes];
+    let t_quantize = Instant::now();
     let written = unsafe {
         sys::ggml_quantize_chunk(
             quant_type,
@@ -4111,6 +4163,7 @@ fn quantized_tensor_write_rows(
             std::ptr::null(),
         )
     };
+    let quantize_elapsed = t_quantize.elapsed();
     if written != quantized.len() {
         return Err(Qwen3TtsError::InvalidInput(format!(
             "quantized KV write produced {written} bytes, expected {}",
@@ -4118,10 +4171,11 @@ fn quantized_tensor_write_rows(
         )));
     }
     let offset = unsafe { token_start * (*tensor).nb[2] };
+    let t_upload = Instant::now();
     unsafe {
         sys::ggml_backend_tensor_set(tensor, quantized.as_ptr().cast(), offset, quantized.len());
     }
-    Ok(())
+    Ok((quantize_elapsed, t_upload.elapsed()))
 }
 
 impl CodePredKvCache {

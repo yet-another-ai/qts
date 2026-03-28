@@ -70,7 +70,7 @@ If you expect all of those EPs to be usable in one binary, verify that your ONNX
 
 The CLI also accepts `--backend`, `--backend-fallback`, `--vocoder-ep`, and `--vocoder-ep-fallback`, which override the environment variables for that invocation.
 
-The experimental talker KV cache can be enabled with **`QWEN3_TTS_TALKER_KV_MODE=turboquant`** or `--talker-kv-mode turboquant`. The current implementation is CPU-only; use `QWEN3_TTS_BACKEND=cpu` when profiling it.
+The experimental talker KV cache can be enabled with **`QWEN3_TTS_TALKER_KV_MODE=turboquant`** or `--talker-kv-mode turboquant`. The cache stays on the selected backend, but quantization still happens on the host before the quantized bytes are uploaded back into the KV tensor.
 
 ### Synthesis stage profile (wall clock)
 
@@ -85,7 +85,7 @@ cargo run --release -p qts_cli -- profile --model-dir "$QWEN3_TTS_MODEL_DIR" --t
 Experimental TurboQuant profile run:
 
 ```bash
-QWEN3_TTS_BACKEND=cpu \
+QWEN3_TTS_BACKEND=vulkan \
 QWEN3_TTS_TALKER_KV_MODE=turboquant \
 cargo run --release -p qts_cli -- profile \
   --model-dir "$QWEN3_TTS_MODEL_DIR" \

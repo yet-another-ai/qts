@@ -89,7 +89,7 @@ For ONNX Runtime features, remember that Cargo features alone do not guarantee a
 
 Experimental runtime knobs:
 - `QWEN3_TTS_TALKER_KV_MODE=f16|turboquant` switches the talker KV cache path at runtime.
-- `turboquant` currently targets the CPU backend only and uses quantized GGML storage for the talker KV cache.
+- `turboquant` uses quantized GGML storage for the talker KV cache on the selected backend, with host-side quantization plus backend upload during KV write-back.
 
 ## Vulkan prerequisites
 
