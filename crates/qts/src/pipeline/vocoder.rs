@@ -7,12 +7,12 @@ use std::slice;
 use std::sync::{Mutex, OnceLock};
 
 use ort::ep::ExecutionProvider;
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::session::IoBinding;
 use ort::session::{
     builder::{GraphOptimizationLevel, SessionBuilder},
     Session,
 };
-use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
-use ort::session::IoBinding;
 use ort::value::Tensor;
 
 use super::backend::BackendKind;
@@ -697,11 +697,10 @@ impl Vocoder {
         n_codebooks: usize,
         model_path: &Path,
     ) -> Result<CachedVocoderTemplate, Qwen3TtsError> {
-        let input = Tensor::<i64>::new(&ort::memory::Allocator::default(), [
-            1usize,
-            n_frames,
-            n_codebooks,
-        ])
+        let input = Tensor::<i64>::new(
+            &ort::memory::Allocator::default(),
+            [1usize, n_frames, n_codebooks],
+        )
         .map_err(ort_err)?;
         let mut binding = session.create_binding().map_err(ort_err)?;
         let cpu_output = MemoryInfo::new(

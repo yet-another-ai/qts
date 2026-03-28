@@ -167,7 +167,8 @@ impl CommonSynthesisArgs {
                 Ok(true)
             }
             "--talker-kv-mode" => {
-                self.talker_kv_mode = TalkerKvMode::parse(&value_arg(args, idx, "--talker-kv-mode")?)?;
+                self.talker_kv_mode =
+                    TalkerKvMode::parse(&value_arg(args, idx, "--talker-kv-mode")?)?;
                 Ok(true)
             }
             _ => Ok(false),

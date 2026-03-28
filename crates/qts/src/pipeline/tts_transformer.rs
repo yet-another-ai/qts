@@ -878,13 +878,16 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2185,13 +2188,16 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2513,13 +2519,16 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -2811,13 +2820,16 @@ impl TtsTransformer {
             let up = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), layer.ffn_up.as_ptr(), cur) };
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3208,13 +3220,16 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3529,7 +3544,8 @@ impl TtsTransformer {
                         sys::ggml_build_forward_expand(graph.as_ptr(), k_store);
                         sys::ggml_build_forward_expand(graph.as_ptr(), v_store);
                     }
-                    let rows = self.config.n_key_value_heads as usize * self.config.head_dim as usize;
+                    let rows =
+                        self.config.n_key_value_heads as usize * self.config.head_dim as usize;
                     kv_writeback.push(KvWritebackTensorDownloads {
                         layer_idx,
                         token_start: n_past,
@@ -3617,13 +3633,16 @@ impl TtsTransformer {
             gate = unsafe { sys::ggml_silu(ctx.as_ptr(), gate) };
             cur = unsafe { sys::ggml_mul(ctx.as_ptr(), gate, up) };
 
-            let ffn_down_f32 = layer.ffn_down_f32.map(NonNull::as_ptr).unwrap_or_else(|| unsafe {
-                sys::ggml_cast(
-                    ctx.as_ptr(),
-                    layer.ffn_down.as_ptr(),
-                    sys::ggml_type_GGML_TYPE_F32,
-                )
-            });
+            let ffn_down_f32 = layer
+                .ffn_down_f32
+                .map(NonNull::as_ptr)
+                .unwrap_or_else(|| unsafe {
+                    sys::ggml_cast(
+                        ctx.as_ptr(),
+                        layer.ffn_down.as_ptr(),
+                        sys::ggml_type_GGML_TYPE_F32,
+                    )
+                });
             cur = unsafe { sys::ggml_mul_mat(ctx.as_ptr(), ffn_down_f32, cur) };
             inp_l = unsafe { sys::ggml_add(ctx.as_ptr(), cur, inp_ff) };
         }
@@ -3864,16 +3883,8 @@ impl TalkerWeights {
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_up.weight"),
                 )?,
-                ffn_down: load_tensor_into_context(
-                    file,
-                    ctx.as_ptr(),
-                    &ffn_down_name,
-                )?,
-                ffn_down_f32: load_tensor_f32_into_context(
-                    file,
-                    ctx.as_ptr(),
-                    &ffn_down_name,
-                )?,
+                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
+                ffn_down_f32: load_tensor_f32_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
             });
         }
 
@@ -4114,14 +4125,12 @@ impl TalkerKvCache {
         v_src: &[f32],
     ) -> Result<(Duration, Duration), Qwen3TtsError> {
         debug_assert!(self.storage.is_quantized());
-        let k = self
-            .k_cache
-            .get(layer_idx)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("talker K cache layer out of range".into()))?;
-        let v = self
-            .v_cache
-            .get(layer_idx)
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("talker V cache layer out of range".into()))?;
+        let k = self.k_cache.get(layer_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("talker K cache layer out of range".into())
+        })?;
+        let v = self.v_cache.get(layer_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("talker V cache layer out of range".into())
+        })?;
         let (k_quantize, k_upload) = quantized_tensor_write_rows(
             k.as_ptr(),
             self.storage.tensor_type(),
@@ -4153,7 +4162,11 @@ fn quantized_tensor_write_rows(
     row_len: usize,
     src: &[f32],
 ) -> Result<(Duration, Duration), Qwen3TtsError> {
-    if src.len() != n_tokens.saturating_mul(rows_per_token).saturating_mul(row_len) {
+    if src.len()
+        != n_tokens
+            .saturating_mul(rows_per_token)
+            .saturating_mul(row_len)
+    {
         return Err(Qwen3TtsError::InvalidInput(
             "quantized KV source rows had an unexpected size".into(),
         ));
@@ -4349,16 +4362,8 @@ impl CodePredWeights {
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_up.weight"),
                 )?,
-                ffn_down: load_tensor_into_context(
-                    file,
-                    ctx.as_ptr(),
-                    &ffn_down_name,
-                )?,
-                ffn_down_f32: load_tensor_f32_into_context(
-                    file,
-                    ctx.as_ptr(),
-                    &ffn_down_name,
-                )?,
+                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
+                ffn_down_f32: load_tensor_f32_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
             });
         }
 
@@ -4545,8 +4550,14 @@ fn load_tensor_f32_into_context(
     for (idx, dim) in info.dims.iter().copied().enumerate() {
         ne[idx] = dim as i64;
     }
-    let tensor =
-        unsafe { sys::ggml_new_tensor(ctx, sys::ggml_type_GGML_TYPE_F32, info.dims.len() as i32, ne.as_ptr()) };
+    let tensor = unsafe {
+        sys::ggml_new_tensor(
+            ctx,
+            sys::ggml_type_GGML_TYPE_F32,
+            info.dims.len() as i32,
+            ne.as_ptr(),
+        )
+    };
     Ok(NonNull::new(tensor))
 }
 

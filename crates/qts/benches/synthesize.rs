@@ -33,7 +33,9 @@ impl BenchConfig {
             top_p: parse_env("QWEN3_TTS_BENCH_TOP_P", 1.0f32),
             talker_kv_mode: env::var("QWEN3_TTS_BENCH_TALKER_KV_MODE")
                 .ok()
-                .map(|value| TalkerKvMode::parse(&value).expect("invalid QWEN3_TTS_BENCH_TALKER_KV_MODE"))
+                .map(|value| {
+                    TalkerKvMode::parse(&value).expect("invalid QWEN3_TTS_BENCH_TALKER_KV_MODE")
+                })
                 .unwrap_or(TalkerKvMode::F16),
         }
     }
