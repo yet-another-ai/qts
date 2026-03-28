@@ -3301,8 +3301,12 @@ impl TtsTransformer {
             "cached prefill graph execution failed",
         )?;
         if cache.storage().is_quantized() {
-            let rows_per_token = self.config.n_key_value_heads as usize;
-            let row_len = self.config.head_dim as usize;
+            let layout = QuantizedKvWriteLayout {
+                token_start: 0,
+                n_tokens,
+                rows_per_token: self.config.n_key_value_heads as usize,
+                row_len: self.config.head_dim as usize,
+            };
             for mut pending in kv_writeback {
                 unsafe {
                     sys::ggml_backend_tensor_get(
@@ -3320,10 +3324,11 @@ impl TtsTransformer {
                 }
                 let _ = cache.quantized_write_layer(
                     pending.layer_idx,
-                    pending.token_start,
-                    pending.n_tokens,
-                    rows_per_token,
-                    row_len,
+                    QuantizedKvWriteLayout {
+                        token_start: pending.token_start,
+                        n_tokens: pending.n_tokens,
+                        ..layout
+                    },
                     pending.k_data.as_slice(),
                     pending.v_data.as_slice(),
                 )?;
@@ -3720,15 +3725,20 @@ impl TtsTransformer {
                 let download_elapsed = t_download.elapsed();
                 let mut quantize_elapsed = Duration::ZERO;
                 let mut upload_elapsed = Duration::ZERO;
-                let rows_per_token = self.config.n_key_value_heads as usize;
-                let row_len = self.config.head_dim as usize;
+                let base_layout = QuantizedKvWriteLayout {
+                    token_start: 0,
+                    n_tokens: 0,
+                    rows_per_token: self.config.n_key_value_heads as usize,
+                    row_len: self.config.head_dim as usize,
+                };
                 for pending in kv_writeback {
                     let (quantize, upload) = cache.quantized_write_layer(
                         pending.layer_idx,
-                        pending.token_start,
-                        pending.n_tokens,
-                        rows_per_token,
-                        row_len,
+                        QuantizedKvWriteLayout {
+                            token_start: pending.token_start,
+                            n_tokens: pending.n_tokens,
+                            ..base_layout
+                        },
                         pending.k_data.as_slice(),
                         pending.v_data.as_slice(),
                     )?;
@@ -4000,6 +4010,14 @@ struct TalkerKvCache {
     n_ctx: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QuantizedKvWriteLayout {
+    token_start: usize,
+    n_tokens: usize,
+    rows_per_token: usize,
+    row_len: usize,
+}
+
 struct CodePredKvCache {
     _ctx: OwnedContext,
     _backends: BackendSet,
@@ -4117,10 +4135,7 @@ impl TalkerKvCache {
     fn quantized_write_layer(
         &self,
         layer_idx: usize,
-        token_start: usize,
-        n_tokens: usize,
-        rows_per_token: usize,
-        row_len: usize,
+        layout: QuantizedKvWriteLayout,
         k_src: &[f32],
         v_src: &[f32],
     ) -> Result<(Duration, Duration), Qwen3TtsError> {
@@ -4131,24 +4146,10 @@ impl TalkerKvCache {
         let v = self.v_cache.get(layer_idx).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("talker V cache layer out of range".into())
         })?;
-        let (k_quantize, k_upload) = quantized_tensor_write_rows(
-            k.as_ptr(),
-            self.storage.tensor_type(),
-            token_start,
-            n_tokens,
-            rows_per_token,
-            row_len,
-            k_src,
-        )?;
-        let (v_quantize, v_upload) = quantized_tensor_write_rows(
-            v.as_ptr(),
-            self.storage.tensor_type(),
-            token_start,
-            n_tokens,
-            rows_per_token,
-            row_len,
-            v_src,
-        )?;
+        let (k_quantize, k_upload) =
+            quantized_tensor_write_rows(k.as_ptr(), self.storage.tensor_type(), layout, k_src)?;
+        let (v_quantize, v_upload) =
+            quantized_tensor_write_rows(v.as_ptr(), self.storage.tensor_type(), layout, v_src)?;
         Ok((k_quantize + v_quantize, k_upload + v_upload))
     }
 }
@@ -4156,12 +4157,15 @@ impl TalkerKvCache {
 fn quantized_tensor_write_rows(
     tensor: *mut sys::ggml_tensor,
     quant_type: sys::ggml_type,
-    token_start: usize,
-    n_tokens: usize,
-    rows_per_token: usize,
-    row_len: usize,
+    layout: QuantizedKvWriteLayout,
     src: &[f32],
 ) -> Result<(Duration, Duration), Qwen3TtsError> {
+    let QuantizedKvWriteLayout {
+        token_start,
+        n_tokens,
+        rows_per_token,
+        row_len,
+    } = layout;
     if src.len()
         != n_tokens
             .saturating_mul(rows_per_token)
