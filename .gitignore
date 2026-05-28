@@ -9,6 +9,7 @@ crates/qts_ggml_sys/vendor/ggml/build/
 .idea
 .vscode
 .venv/
+runtimes/
 __pycache__/
 *.pyc
 

@@ -37,10 +37,14 @@ xnnpack = ["ort/xnnpack"]
 qts_ggml.workspace = true
 thiserror.workspace = true
 rand.workspace = true
+rayon.workspace = true
 hound.workspace = true
 rustfft.workspace = true
 prost.workspace = true
 ort.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+libloading.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

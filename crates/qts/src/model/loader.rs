@@ -168,6 +168,24 @@ impl GgufFile {
                 }
                 out
             }
+            sys::ggml_type_GGML_TYPE_Q8_0 => {
+                const QK8_0: usize = 32;
+                const BLOCK_Q8_0_SIZE: usize = 2 + QK8_0;
+                if element_count % QK8_0 != 0
+                    || info.size != element_count / QK8_0 * BLOCK_Q8_0_SIZE
+                {
+                    return Err(Qwen3TtsError::InvalidTensor(name.into()));
+                }
+                let mut out = Vec::with_capacity(element_count);
+                for block in raw.chunks_exact(BLOCK_Q8_0_SIZE) {
+                    let scale = u16::from_le_bytes(block[0..2].try_into().expect("q8_0 scale"));
+                    let scale = unsafe { sys::ggml_fp16_to_fp32(scale) };
+                    for &q in &block[2..] {
+                        out.push(scale * (q as i8 as f32));
+                    }
+                }
+                out
+            }
             _ => return Err(Qwen3TtsError::UnsupportedTensorType(name.into())),
         };
 

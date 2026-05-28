@@ -1,8 +1,13 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use qts::{Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode};
+use hound::{SampleFormat, WavSpec, WavWriter};
+use qts::{
+    Qwen3TtsEngine, SynthesizeRequest, TalkerKvMode, TensorF32, VoiceClonePromptV2,
+    VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeBackendOverrides {
@@ -73,7 +78,12 @@ pub(crate) struct CommonSynthesisArgs {
     pub(crate) model_dir: PathBuf,
     pub(crate) text: Option<String>,
     pub(crate) out_path: Option<PathBuf>,
+    pub(crate) dump_codec_frames_path: Option<PathBuf>,
     pub(crate) voice_clone_prompt: Option<PathBuf>,
+    pub(crate) voice_clone_wav: Option<PathBuf>,
+    pub(crate) voice_clone_ref_text: Option<String>,
+    pub(crate) speaker: Option<String>,
+    pub(crate) instruct: Option<String>,
     pub(crate) thread_count: usize,
     pub(crate) max_audio_frames: Option<usize>,
     pub(crate) temperature: f32,
@@ -93,7 +103,12 @@ impl CommonSynthesisArgs {
             model_dir: default_model_dir()?,
             text: None,
             out_path: None,
+            dump_codec_frames_path: None,
             voice_clone_prompt: None,
+            voice_clone_wav: None,
+            voice_clone_ref_text: None,
+            speaker: None,
+            instruct: None,
             thread_count: 4,
             max_audio_frames: None,
             temperature: 0.9,
@@ -125,9 +140,31 @@ impl CommonSynthesisArgs {
                 self.out_path = Some(PathBuf::from(value_arg(args, idx, "--out")?));
                 Ok(true)
             }
+            "--dump-codec-frames" => {
+                self.dump_codec_frames_path =
+                    Some(PathBuf::from(value_arg(args, idx, "--dump-codec-frames")?));
+                Ok(true)
+            }
             "--voice-clone-prompt" => {
                 self.voice_clone_prompt =
                     Some(PathBuf::from(value_arg(args, idx, "--voice-clone-prompt")?));
+                Ok(true)
+            }
+            "--voice-clone-wav" => {
+                self.voice_clone_wav =
+                    Some(PathBuf::from(value_arg(args, idx, "--voice-clone-wav")?));
+                Ok(true)
+            }
+            "--voice-clone-ref-text" => {
+                self.voice_clone_ref_text = Some(value_arg(args, idx, "--voice-clone-ref-text")?);
+                Ok(true)
+            }
+            "--speaker" => {
+                self.speaker = Some(value_arg(args, idx, "--speaker")?);
+                Ok(true)
+            }
+            "--instruct" => {
+                self.instruct = Some(value_arg(args, idx, "--instruct")?);
                 Ok(true)
             }
             "--threads" => {
@@ -176,6 +213,20 @@ impl CommonSynthesisArgs {
     }
 
     pub(crate) fn validate_conditioning(&self) -> Result<()> {
+        let clone_modes = usize::from(self.voice_clone_prompt.is_some())
+            + usize::from(self.voice_clone_wav.is_some());
+        if clone_modes > 1 {
+            anyhow::bail!("--voice-clone-prompt cannot be combined with --voice-clone-wav");
+        }
+        if clone_modes > 0 && self.speaker.is_some() {
+            anyhow::bail!("voice clone flags cannot be combined with --speaker");
+        }
+        if clone_modes > 0 && self.instruct.is_some() {
+            anyhow::bail!("voice clone flags cannot be combined with --instruct");
+        }
+        if self.voice_clone_ref_text.is_some() && self.voice_clone_wav.is_none() {
+            anyhow::bail!("--voice-clone-ref-text requires --voice-clone-wav");
+        }
         Ok(())
     }
 
@@ -249,4 +300,87 @@ where
     value
         .parse::<T>()
         .map_err(|err| anyhow::anyhow!("invalid value for {flag}: {err}"))
+}
+
+pub(crate) fn encode_wav_f32(sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<Vec<u8>> {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec).context("failed to create WAV")?;
+        for sample in pcm_f32.iter().copied() {
+            let clamped = sample.clamp(-1.0, 1.0);
+            writer
+                .write_sample((clamped * i16::MAX as f32) as i16)
+                .context("failed to write WAV sample")?;
+        }
+        writer.finalize().context("failed to finalize WAV")?;
+    }
+    Ok(cursor.into_inner())
+}
+
+pub(crate) fn write_wav_f32(path: &Path, sample_rate_hz: u32, pcm_f32: &[f32]) -> Result<()> {
+    let bytes = encode_wav_f32(sample_rate_hz, pcm_f32)?;
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub(crate) fn build_wav_only_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    model_dir: &Path,
+    source: impl Into<String>,
+    wav_bytes: &[u8],
+) -> Result<VoiceClonePromptV2> {
+    let speaker_embedding = engine.encode_reference_speaker(wav_bytes)?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: source.into(),
+        model_id: model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: true,
+        icl_mode: false,
+        ref_text: String::new(),
+        ref_code: None,
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
+}
+
+pub(crate) fn build_icl_voice_clone_prompt(
+    engine: &Qwen3TtsEngine,
+    model_dir: &Path,
+    source: impl Into<String>,
+    wav_bytes: &[u8],
+    ref_text: &str,
+) -> Result<VoiceClonePromptV2> {
+    let speaker_embedding = engine.encode_reference_speaker(wav_bytes)?;
+    let ref_code = engine.encode_reference_audio_codes(wav_bytes).with_context(|| {
+        format!(
+            "failed to encode reference audio codes; ensure qwen3-tts-tokenizer-encoder.onnx exists in {}",
+            model_dir.display()
+        )
+    })?;
+    let prompt = VoiceClonePromptV2 {
+        schema_version: VOICE_CLONE_PROMPT_V2_SCHEMA_VERSION,
+        source: source.into(),
+        model_id: model_dir.display().to_string(),
+        speaker_encoder_sample_rate_hz: 16_000,
+        x_vector_only_mode: false,
+        icl_mode: true,
+        ref_text: ref_text.to_string(),
+        ref_code: Some(ref_code),
+        ref_spk_embedding: Some(TensorF32 {
+            shape: vec![speaker_embedding.len() as u32],
+            values: speaker_embedding,
+        }),
+    };
+    prompt.validate()?;
+    Ok(prompt)
 }

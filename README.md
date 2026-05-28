@@ -24,6 +24,8 @@
 ## Quick start
 
 **You need:** [Rust](https://rustup.rs/), **CMake** on your `PATH`, and Git (for the ggml submodule).
+On Windows, use the MSVC Rust toolchain plus Visual Studio 2022 Build Tools;
+Vulkan builds also need the Vulkan SDK (`glslc` on `PATH`).
 
 1. **Clone and fetch ggml**
 
@@ -48,6 +50,8 @@
    ```
 
    Those names match the default lookup used by `--model-dir` (see [`ModelPaths`](crates/qts/src/model/paths.rs)).
+   VoiceDesign and CustomVoice model folders also need their exported
+   `config.json`; see [Model type config](#model-type-config).
 
 4. **Synthesize**
 
@@ -106,6 +110,40 @@ GPU features are declared on `qts_ggml_sys` / `qts`; details and version pins li
 
 **Runtime behavior:** with GPU features enabled, `auto` prefers **Metal** on Apple and **Vulkan** on other platforms, then falls back to **CPU** if init fails. Builds without those features use **CPU** only for GGML.
 
+### Package the CLI runtime
+
+Use `xtask package-cli` to build `qts_cli` and gather the executable plus
+runtime DLLs into one directory:
+
+```bash
+cargo xtask package-cli
+```
+
+Defaults are equivalent to:
+
+```bash
+cargo build --release -p qts_cli --no-default-features --features vulkan
+```
+
+The package is written to `target/qts-cli-package/`. On Windows it contains
+`qts_cli.exe`, `onnxruntime.dll`, the bundled MSVC-built `soxr.dll`, and any
+available ONNX Runtime provider DLLs found next to the build output or in
+`.venv/Lib/site-packages/onnxruntime/capi`.
+
+Useful variants:
+
+```bash
+cargo xtask package-cli --out-dir target/qts-cli-win
+cargo xtask package-cli --features "vulkan,directml"
+cargo xtask package-cli --no-features
+cargo xtask package-cli --profile debug --skip-build
+```
+
+`soxr.dll` is built automatically by `qts` using CMake. On Windows the build
+script forces the Visual Studio 2022 generator (`-A x64` for x86_64 targets)
+instead of MinGW. Set `QWEN3_TTS_SKIP_BUNDLED_SOXR=1` to skip that build, or
+`QWEN3_TTS_SOXR_SRC=/path/to/soxr` to use an existing checkout.
+
 Full workspace:
 
 ```bash
@@ -136,6 +174,40 @@ Where to download, how to export, and layout options: **[docs/models.md](docs/mo
 - `qwen3-tts-vocoder.onnx`
 - One of: `qwen3-tts-0.6b-f16.gguf`, `qwen3-tts-0.6b-q8_0.gguf`, … (see `ModelPaths` for the full preference order)
 
+### Model type config
+
+VoiceDesign and CustomVoice exports should keep their source `config.json` in
+the same `--model-dir` as the GGUF and vocoder. `qts` reads this file to
+determine the model type, especially `tts_model_type` values such as
+`voice_design` and `custom_voice`. Without it, a fixed server mode like
+`--mode design` or `--mode custom` can reject requests or use the wrong
+conditioning path.
+
+Recommended layouts:
+
+```text
+models/Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+  qwen3-tts-1.7b-voicedesign-q8_0.gguf
+  qwen3-tts-vocoder.onnx
+  config.json
+  qwen3-tts-tokenizer-encoder.onnx  # recommended for long-form voice stability
+
+models/Qwen3-TTS-12Hz-1.7B-CustomVoice/
+  qwen3-tts-1.7b-customvoice-q8_0.gguf
+  qwen3-tts-vocoder.onnx
+  config.json
+
+models/Qwen3-TTS-12Hz-0.6B-Base/
+  qwen3-tts-0.6b-f16.gguf
+  qwen3-tts-vocoder.onnx
+  qwen3-tts-tokenizer-encoder.onnx  # required for WAV voice clone prompts
+```
+
+For long-form VoiceDesign jobs, `qts_server` uses
+`qwen3-tts-tokenizer-encoder.onnx` when it is present to build an ICL prompt
+from the first generated segment, so later segments keep the same voice. If the
+encoder is missing, it falls back to speaker-embedding reuse.
+
 ### Maintainers: two repos, one workflow
 
 | Repo | Role |
@@ -153,9 +225,63 @@ cargo xtask hf-release --model Qwen/qts-12Hz-0.6B-Base
 
 Add `--hf-repo-dir /path/to/cloned-hf-repo` to sync into an existing clone. CI (`.github/workflows/`) builds release binaries and can publish tagged releases; see workflow comments for `HF_TOKEN` and related setup.
 
+CLI runtime packaging helper:
+
+```bash
+cargo xtask package-cli
+```
+
 ---
 
 ## Using the CLI
+
+### HTTP server
+
+`qts_server` is a separate executable. The conditioning mode is fixed at
+startup, so requests cannot switch a running server between `none`, `custom`,
+`design`, and `clone`.
+For long inputs, the server splits text into sequential synthesis segments,
+concatenates the audio into one WAV response, and reports aggregate async job
+progress.
+
+```bash
+cargo run --release -p qts_cli --bin qts_server -- \
+  --mode design \
+  --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --backend vulkan \
+  --vocoder-ep cpu \
+  --language-id 2055 \
+  --instruct "温柔年轻女声"
+```
+
+Health and async job flow:
+
+```bash
+curl http://127.0.0.1:8080/health
+
+curl -X POST http://127.0.0.1:8080/v1/qts/audio/jobs \
+  -H "content-type: application/json" \
+  -d '{"input":"你好，测试一下进度查询。","instructions":"温柔年轻女声","frames":64,"response_format":"wav"}'
+
+curl http://127.0.0.1:8080/v1/qts/audio/jobs/1
+curl -o out.wav http://127.0.0.1:8080/v1/qts/audio/jobs/1/audio
+```
+
+OpenAI-compatible synchronous speech endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/audio/speech \
+  -H "content-type: application/json" \
+  -d '{"model":"qwen3-tts","input":"你好","voice":"default","instructions":"温柔年轻女声","response_format":"wav"}' \
+  -o out.wav
+```
+
+Mode-specific startup flags:
+
+```bash
+qts_server --mode custom --speaker serena --model-dir models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+qts_server --mode clone --voice-clone-wav ref.wav --voice-clone-ref-text "reference text" --model-dir models/Qwen3-TTS-12Hz-0.6B-Base
+```
 
 ### Synthesize text to WAV
 
@@ -168,38 +294,37 @@ cargo run --release -p qts_cli -- synthesize \
 
 Useful knobs include `--threads`, `--frames` (max audio frames), `--temperature`, `--top-p`, `--top-k`, `--language-id`, and `--chunk-size` (see `--help` on the binary). Backend overrides: `--backend`, `--vocoder-ep`, plus fallback chains. `--vocoder-ep` accepts `auto` or any enabled native ORT EP token such as `coreml`, `directml`, `cuda`, `openvino`, `tensorrt`, or `xnnpack`.
 
-### Voice clone prompts
+### Voice clone from WAV / prompts
 
-To stay aligned with upstream **Qwen3 TTS**, conditioning uses **protobuf prompts** (exported from Python), not raw reference audio at synthesis time.
+The CLI can consume a reference WAV directly without Python. `--voice-clone-wav`
+alone uses the lighter x-vector-only path. Add `--voice-clone-ref-text` to use
+the native upstream-style ICL clone path. Native ICL requires
+`qwen3-tts-tokenizer-encoder.onnx`; the bundled MSVC-built `soxr.dll` handles
+Python-free audio-code extraction at runtime. You can still override the
+resampler with `QWEN3_TTS_SOXR_DLL`, or place `libsoxr.dll` / `soxr.dll` next to
+the executable.
 
-**Modes:**
+Reusable protobuf prompts generated by `export-voice-clone-prompt` are also
+accepted as a compatibility/cache format.
 
-- **xvector-only** — speaker identity from the reference clip.
-- **ICL** — identity plus reference text and codec prompt (closer to upstream `create_voice_clone_prompt`).
-
-**xvector-only example**
+**Direct WAV example**
 
 ```bash
-uv sync
-
-uv run export-voice-clone-prompt \
-  --model Qwen/qts-12Hz-0.6B-Base \
-  --ref-audio testdata/hello.wav \
-  --x-vector-only-mode \
-  --out target/hello.xvector.voice-clone-prompt.pb
-
 cargo run --release -p qts_cli -- synthesize \
   --model-dir models \
   --text "hello" \
-  --voice-clone-prompt target/hello.xvector.voice-clone-prompt.pb \
+  --voice-clone-wav testdata/hello.wav \
   --out target/hello-from-xvector.wav
 ```
 
-**ICL example**
+**Reusable ICL prompt example**
+
+Reusable protobuf prompts are still accepted as a compatibility/cache format.
+They are useful while the tokenizer encoder artifact is being produced.
 
 ```bash
 uv run export-voice-clone-prompt \
-  --model Qwen/qts-12Hz-0.6B-Base \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --ref-audio testdata/hello.wav \
   --ref-text "hello" \
   --out target/hello.voice-clone-prompt.pb
@@ -211,10 +336,23 @@ cargo run --release -p qts_cli -- synthesize \
   --out target/hello-from-icl.wav
 ```
 
-The engine reads fields such as `ref_spk_embedding`, `ref_code`, `ref_text`, and the `icl_mode` / `x_vector_only_mode` flags. Legacy wrapper:
+**Native ICL WAV example**
 
 ```bash
-uv run python scripts/export_voice_clone_prompt.py --help
+cargo run --release -p qts_cli -- synthesize \
+  --model-dir models \
+  --text "hello" \
+  --voice-clone-wav testdata/hello.wav \
+  --voice-clone-ref-text "hello" \
+  --out target/hello-from-icl.wav
+```
+
+`--voice-clone-prompt` files contain fields such as `ref_spk_embedding`,
+`ref_code`, `ref_text`, and the `icl_mode` / `x_vector_only_mode` flags. Export
+helper:
+
+```bash
+uv run export-voice-clone-prompt --help
 ```
 
 ### Interactive TUI

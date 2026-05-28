@@ -163,6 +163,10 @@ struct BackendSetInner {
 }
 
 impl BackendSet {
+    pub(crate) fn cpu() -> Result<Self, Qwen3TtsError> {
+        Self::with_primary(OwnedBackend::cpu()?, BackendKind::Cpu, None)
+    }
+
     pub(crate) fn new() -> Result<Self, Qwen3TtsError> {
         unsafe {
             sys::ggml_backend_load_all();
@@ -575,12 +579,22 @@ pub(crate) fn execute_graph(
 ) -> Result<(), Qwen3TtsError> {
     maybe_log_backend_support(backends, graph, error_message);
     backends.configure_threads(thread_count);
+    let debug_enabled = backend_debug_enabled();
+    let alloc_start = debug_enabled.then(std::time::Instant::now);
     let galloc = backends.primary_galloc();
     let allocated = unsafe { sys::ggml_gallocr_alloc_graph(galloc.raw.as_ptr(), graph.as_ptr()) };
+    let alloc_elapsed = alloc_start.map(|start| start.elapsed());
     if !allocated {
         return Err(Qwen3TtsError::InvalidInput(format!(
             "failed to allocate backend graph for {error_message}"
         )));
+    }
+    if let Some(alloc_elapsed) = alloc_elapsed {
+        let n_nodes = unsafe { sys::ggml_graph_n_nodes(graph.as_ptr()) };
+        eprintln!(
+            "[graph_alloc] alloc={:.2}ms nodes={n_nodes} ({error_message})",
+            alloc_elapsed.as_secs_f64() * 1000.0,
+        );
     }
     run_graph_impl(backends, graph, uploads, downloads, error_message)
 }

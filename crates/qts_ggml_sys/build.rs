@@ -14,6 +14,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        ggml_root.join("src/ggml-vulkan/ggml-vulkan.cpp").display()
+    );
     println!("cargo:rerun-if-env-changed=GGML_SRC");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-env-changed=BLA_VENDOR");

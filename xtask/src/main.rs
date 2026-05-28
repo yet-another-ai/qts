@@ -11,6 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("bench") => run_bench(args.collect()),
         Some("profile") => run_profile(args.collect()),
         Some("hf-release") => run_hf_release(args.collect()),
+        Some("package-cli") => run_package_cli(args.collect()),
         _ => {
             print_usage();
             Ok(())
@@ -309,6 +310,114 @@ fn run_hf_release(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         out_dir.display(),
         artifacts_dir.display()
     );
+    Ok(())
+}
+
+fn run_package_cli(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_package_cli_help();
+        return Ok(());
+    }
+
+    let workspace_root = workspace_root()?;
+    let mut out_dir = workspace_root.join("target/qts-cli-package");
+    let mut profile = String::from("release");
+    let mut features = Some(String::from("vulkan"));
+    let mut no_default_features = true;
+    let mut skip_build = false;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--out-dir" => {
+                out_dir = PathBuf::from(value_arg(&args, &mut idx, "--out-dir")?);
+            }
+            "--profile" => {
+                profile = value_arg(&args, &mut idx, "--profile")?;
+                if !matches!(profile.as_str(), "debug" | "release") {
+                    return Err("--profile must be debug or release".into());
+                }
+            }
+            "--features" => {
+                features = Some(value_arg(&args, &mut idx, "--features")?);
+            }
+            "--no-features" => {
+                features = None;
+                idx += 1;
+            }
+            "--default-features" => {
+                no_default_features = false;
+                idx += 1;
+            }
+            "--skip-build" => {
+                skip_build = true;
+                idx += 1;
+            }
+            other => return Err(format!("unknown xtask package-cli argument: {other}").into()),
+        }
+    }
+
+    if !skip_build {
+        let mut command = Command::new("cargo");
+        command.current_dir(&workspace_root);
+        command.args(["build", "-p", "qts_cli"]);
+        if profile == "release" {
+            command.arg("--release");
+        }
+        if no_default_features {
+            command.arg("--no-default-features");
+        }
+        if let Some(features) = features.as_ref().filter(|value| !value.trim().is_empty()) {
+            command.args(["--features", features]);
+        }
+        eprintln!("building qts_cli for packaging: {command:?}");
+        let status = command.status()?;
+        if !status.success() {
+            return Err("cargo build failed".into());
+        }
+    }
+
+    let profile_dir = workspace_root.join("target").join(&profile);
+    let exe_name = if cfg!(windows) {
+        "qts_cli.exe"
+    } else {
+        "qts_cli"
+    };
+    let exe_path = profile_dir.join(exe_name);
+    if !exe_path.is_file() {
+        return Err(format!("missing built executable: {}", exe_path.display()).into());
+    }
+
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)?;
+    }
+    fs::create_dir_all(&out_dir)?;
+
+    let mut copied = Vec::new();
+    copy_required_file(&exe_path, &out_dir, &mut copied)?;
+
+    for dll in runtime_dll_candidates(&workspace_root, &profile_dir) {
+        if dll.is_file() {
+            copy_required_file(&dll, &out_dir, &mut copied)?;
+        }
+    }
+
+    let missing = required_runtime_dll_names()
+        .into_iter()
+        .filter(|name| !out_dir.join(name).is_file())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "packaged CLI is missing required runtime DLLs: {}",
+            missing.join(", ")
+        )
+        .into());
+    }
+
+    eprintln!("packaged qts_cli runtime: {}", out_dir.display());
+    for path in copied {
+        eprintln!("  {}", path.display());
+    }
     Ok(())
 }
 
@@ -626,6 +735,85 @@ fn remove_managed_release_files(dir: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn runtime_dll_candidates(workspace_root: &Path, profile_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for name in required_runtime_dll_names()
+        .into_iter()
+        .chain(optional_runtime_dll_names())
+    {
+        candidates.push(profile_dir.join(name));
+    }
+
+    if cfg!(windows) {
+        candidates.extend(ort_python_runtime_dlls(workspace_root));
+    }
+
+    let mut seen_names = Vec::<String>::new();
+    candidates
+        .into_iter()
+        .filter(|path| {
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_ascii_lowercase())
+            else {
+                return false;
+            };
+            if seen_names.iter().any(|existing| existing == &name) {
+                false
+            } else {
+                seen_names.push(name);
+                true
+            }
+        })
+        .collect()
+}
+
+fn required_runtime_dll_names() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["onnxruntime.dll", "soxr.dll"]
+    } else {
+        Vec::new()
+    }
+}
+
+fn optional_runtime_dll_names() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec![
+            "DirectML.dll",
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_cuda.dll",
+            "onnxruntime_providers_tensorrt.dll",
+            "onnxruntime_providers_nv_tensorrt_rtx.dll",
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn ort_python_runtime_dlls(workspace_root: &Path) -> Vec<PathBuf> {
+    let capi = workspace_root.join(".venv/Lib/site-packages/onnxruntime/capi");
+    required_runtime_dll_names()
+        .into_iter()
+        .chain(optional_runtime_dll_names())
+        .map(|name| capi.join(name))
+        .collect()
+}
+
+fn copy_required_file(
+    path: &Path,
+    out_dir: &Path,
+    copied: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("path has no file name: {}", path.display()))?;
+    let dest = out_dir.join(file_name);
+    fs::copy(path, &dest)?;
+    copied.push(dest);
+    Ok(())
+}
+
 fn is_managed_release_file_name(name: &str) -> bool {
     matches!(
         name,
@@ -684,7 +872,7 @@ fn value_arg(
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask hf-release --help"
+        "usage:\n  cargo xtask bench [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--threads N] [--frames N] [--temperature F] [--top-k N] [--top-p F] [-- <criterion args>]\n  cargo xtask profile [cpu|metal|vulkan|all|both] [--model-dir PATH] [--text TEXT] [--runs N] [--out OUT.wav] [--voice-clone-prompt] [... same flags as synthesize ...]\n  cargo xtask package-cli [--out-dir PATH] [--profile release|debug] [--features LIST|--no-features] [--default-features] [--skip-build]\n  cargo xtask hf-release --model MODEL [--main-type TYPE] [--artifacts-dir PATH] [--out-dir PATH] [--hf-repo-dir PATH] [--readme-template PATH] [--source-commit SHA] [--local-files-only] [--verbose] [--skip-export]\n\nTry: cargo xtask profile --help\n     cargo xtask package-cli --help\n     cargo xtask hf-release --help"
     );
 }
 
@@ -710,5 +898,16 @@ fn print_hf_release_help() {
          `SHA256SUMS`, and `.gitattributes`, and marks `.gguf` / `.onnx` for Hugging Face Xet in the prepared release directory.\n\n\
          If --hf-repo-dir is set, those managed release files are also synced into that existing cloned git repository root.\n\n\
          Use --skip-export only when you intentionally want to package already-generated artifacts."
+    );
+}
+
+fn print_package_cli_help() {
+    eprintln!(
+        "cargo xtask package-cli — build qts_cli and gather runtime files\n\n\
+         usage:\n  cargo xtask package-cli [--out-dir PATH] [--profile release|debug] [--features LIST|--no-features] [--default-features] [--skip-build]\n\n\
+         Defaults:\n  --out-dir target/qts-cli-package\n  --profile release\n  --features vulkan\n  --no-default-features\n\n\
+         The command builds `qts_cli`, then copies the executable plus required runtime DLLs into one directory.\n\
+         On Windows this includes `onnxruntime.dll` and the bundled MSVC-built `soxr.dll`; available ORT provider DLLs next to the build or in `.venv/Lib/site-packages/onnxruntime/capi` are copied too.\n\n\
+         Example:\n  cargo xtask package-cli\n  cargo xtask package-cli --features \"vulkan,directml\" --out-dir target/qts-cli-win"
     );
 }

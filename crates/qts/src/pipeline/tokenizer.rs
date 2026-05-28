@@ -33,6 +33,7 @@ pub struct TextTokenizer {
     id_to_token: Vec<String>,
     bpe_ranks: HashMap<(String, String), i32>,
     assistant_token_id: i32,
+    user_token_id: i32,
     newline_token_id: i32,
 }
 
@@ -86,6 +87,11 @@ impl TextTokenizer {
             .copied()
             .or_else(|| vocab.get("Ġassistant").copied())
             .ok_or_else(|| Qwen3TtsError::MissingTokenizerToken("assistant".into()))?;
+        let user_token_id = vocab
+            .get("user")
+            .copied()
+            .or_else(|| vocab.get("Ġuser").copied())
+            .ok_or_else(|| Qwen3TtsError::MissingTokenizerToken("user".into()))?;
         let newline_token_id = vocab
             .get("Ċ")
             .copied()
@@ -98,6 +104,7 @@ impl TextTokenizer {
             id_to_token,
             bpe_ranks,
             assistant_token_id,
+            user_token_id,
             newline_token_id,
         })
     }
@@ -161,6 +168,19 @@ impl TextTokenizer {
     pub fn encode_ref_for_tts(&self, text: &str) -> Vec<i32> {
         let mut tokens = Vec::new();
         tokens.extend_from_slice(&self.assistant_prefix_tokens());
+        tokens.extend(self.encode(text));
+        tokens.push(self.config.eos_token_id);
+        tokens.push(self.newline_token_id);
+        tokens
+    }
+
+    #[must_use]
+    pub fn encode_instruct_for_tts(&self, text: &str) -> Vec<i32> {
+        let mut tokens = vec![
+            self.config.bos_token_id,
+            self.user_token_id,
+            self.newline_token_id,
+        ];
         tokens.extend(self.encode(text));
         tokens.push(self.config.eos_token_id);
         tokens.push(self.newline_token_id);

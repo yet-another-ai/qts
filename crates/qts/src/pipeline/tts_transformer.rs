@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 
 use qts_ggml::sys;
 use rand::RngExt;
+use rayon::prelude::*;
 
 use super::backend::{
     execute_graph, ggml_soft_max_ext_with_diag_mask_cache, graph_metadata_mem_size, slice_as_bytes,
     slice_as_bytes_mut, BackendKind, BackendSet, OwnedBuffer, TensorDownload, TensorUpload,
 };
 use crate::model::GgufFile;
-use crate::{Qwen3TtsError, TalkerKvMode};
+use crate::{Qwen3TtsError, SynthesisProgress, TalkerKvMode};
 
 #[derive(Debug, Clone)]
 pub struct TtsTransformerConfig {
@@ -29,6 +30,7 @@ pub struct TtsTransformerConfig {
     pub codec_vocab_size: i32,
     pub n_codebooks: i32,
     pub code_pred_layers: i32,
+    pub code_pred_hidden_size: i32,
     pub code_pred_vocab_size: i32,
     pub codec_pad_id: i32,
     pub codec_bos_id: i32,
@@ -59,6 +61,7 @@ impl Default for TtsTransformerConfig {
             codec_vocab_size: 3_072,
             n_codebooks: 16,
             code_pred_layers: 5,
+            code_pred_hidden_size: 1_024,
             code_pred_vocab_size: 2_048,
             codec_pad_id: 2_148,
             codec_bos_id: 2_149,
@@ -91,6 +94,7 @@ pub struct PreparedPrefillInputs {
 #[derive(Debug, Clone, Copy)]
 pub struct PrefillConditioning<'a> {
     pub text_tokens: &'a [i32],
+    pub instruct_tokens: &'a [i32],
     pub speaker_embd: Option<&'a [f32]>,
     pub ref_codebook_0: &'a [i32],
     pub language_id: i32,
@@ -120,6 +124,19 @@ pub struct SelectedCodecFrame {
     pub logits: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CodePredTopLogit {
+    pub token: i32,
+    pub logit: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodePredDebugStep {
+    pub codebook_index: usize,
+    pub selected_token: i32,
+    pub top_logits: Vec<CodePredTopLogit>,
+}
+
 /// Sub-component wall-clock breakdown within a single codec rollout.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodecRolloutSubTimings {
@@ -146,6 +163,8 @@ pub struct CodecRollout {
     pub frames: Vec<SelectedCodecFrame>,
     pub first_frame_elapsed: Duration,
     pub sub_timings: CodecRolloutSubTimings,
+    pub debug_step_embeddings: Vec<Vec<f32>>,
+    pub debug_trailing_rows: Vec<Vec<f32>>,
 }
 
 pub struct VocoderChunk {
@@ -177,6 +196,8 @@ struct KvWritebackTensorDownloads {
     k_data: Vec<f32>,
     v_data: Vec<f32>,
 }
+
+const CUSTOMVOICE_GREEDY_STABILITY_EPS: f32 = 0.01;
 
 impl TtsTransformer {
     fn recent_codebook0_tokens_from_frames(frames: &[SelectedCodecFrame]) -> Vec<i32> {
@@ -284,6 +305,14 @@ impl TtsTransformer {
             ],
             cfg.code_pred_layers,
         );
+        cfg.code_pred_hidden_size = get_u32_any(
+            file,
+            &[
+                "qwen3-tts.code_pred.hidden_size",
+                "qwen3-tts.code_predictor.hidden_size",
+            ],
+            cfg.code_pred_hidden_size,
+        );
         cfg.code_pred_vocab_size = get_u32_any(
             file,
             &[
@@ -362,8 +391,21 @@ impl TtsTransformer {
             cfg.english_language_id,
         );
 
-        let talker_backends = BackendSet::new()?;
-        let code_pred_backends = BackendSet::new()?;
+        let is_custom_voice = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let force_cpu_talker = is_custom_voice
+            && std::env::var("QTS_CUSTOMVOICE_FORCE_CPU_TALKER")
+                .map(|value| value.trim() == "1")
+                .unwrap_or(false);
+        let talker_backends = if force_cpu_talker {
+            BackendSet::cpu()?
+        } else {
+            BackendSet::new()?
+        };
+        let code_pred_backends = if is_custom_voice {
+            BackendSet::cpu()?
+        } else {
+            BackendSet::new()?
+        };
         let talker = TalkerWeights::load(file, &cfg, talker_backends)?;
         let code_pred = CodePredWeights::load(file, &cfg, code_pred_backends)?;
 
@@ -390,12 +432,13 @@ impl TtsTransformer {
         thread_count: usize,
     ) -> Result<PreparedPrefillInputs, Qwen3TtsError> {
         let text_tokens = conditioning.text_tokens;
+        let instruct_tokens = conditioning.instruct_tokens;
         let speaker_embd = conditioning.speaker_embd;
         let ref_codebook_0 = conditioning.ref_codebook_0;
         let language_id = conditioning.language_id;
-        if text_tokens.len() < 4 {
+        if text_tokens.len() < 8 {
             return Err(Qwen3TtsError::InvalidInput(
-                "need at least 4 text tokens for prefill".into(),
+                "need a full non-streaming TTS prompt for prefill".into(),
             ));
         }
 
@@ -415,6 +458,9 @@ impl TtsTransformer {
                 )));
             }
         }
+
+        let instruct_proj = self.project_text_tokens(instruct_tokens, thread_count)?;
+        let instruct_len = instruct_proj.len() / hidden_size;
 
         let special_tokens = [
             self.config.tts_bos_token_id,
@@ -504,39 +550,50 @@ impl TtsTransformer {
             }
         }
 
-        let first_text_embed = &text_proj[3 * hidden_size..4 * hidden_size];
-        let codec_bos_embed = &codec_input_embedding
-            [(codec_input_len - 1) * hidden_size..codec_input_len * hidden_size];
-        let mut first_text_plus_codec_bos = vec![0.0f32; hidden_size];
+        let target_text_tokens = &text_tokens[3..text_tokens.len() - 5];
+        let target_text_proj = self.project_text_tokens(target_text_tokens, thread_count)?;
+        let target_text_len = target_text_tokens.len();
+        let codec_pad_embed = &codec_tail_embed[..hidden_size];
+        let codec_bos_embed = &codec_tail_embed[hidden_size..hidden_size * 2];
+
+        let mut text_plus_codec_pad = vec![0.0f32; (target_text_len + 1) * hidden_size];
+        for row_idx in 0..target_text_len {
+            let text_row = &target_text_proj[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+            let out_row =
+                &mut text_plus_codec_pad[row_idx * hidden_size..(row_idx + 1) * hidden_size];
+            for h in 0..hidden_size {
+                out_row[h] = text_row[h] + codec_pad_embed[h];
+            }
+        }
+        let eos_offset = target_text_len * hidden_size;
         for h in 0..hidden_size {
-            first_text_plus_codec_bos[h] = first_text_embed[h] + codec_bos_embed[h];
+            text_plus_codec_pad[eos_offset + h] = tts_eos_embed[h] + codec_pad_embed[h];
         }
 
-        let prefill_len = 3 + codec_plus_overlay_len + 1;
+        let mut tts_pad_plus_codec_bos = vec![0.0f32; hidden_size];
+        for h in 0..hidden_size {
+            tts_pad_plus_codec_bos[h] = tts_pad_embed[h] + codec_bos_embed[h];
+        }
+
+        let prefill_len =
+            instruct_len + 3 + codec_plus_overlay_len + text_plus_codec_pad.len() / hidden_size + 1;
         let mut prefill_embd = vec![0.0f32; prefill_len * hidden_size];
-        prefill_embd[..role_embed.len()].copy_from_slice(&role_embed);
-        let codec_offset = 3 * hidden_size;
+        if !instruct_proj.is_empty() {
+            prefill_embd[..instruct_proj.len()].copy_from_slice(&instruct_proj);
+        }
+        let role_offset = instruct_proj.len();
+        prefill_embd[role_offset..role_offset + role_embed.len()].copy_from_slice(&role_embed);
+        let codec_offset = role_offset + 3 * hidden_size;
         prefill_embd[codec_offset..codec_offset + codec_plus_overlay.len()]
             .copy_from_slice(&codec_plus_overlay);
-        let final_offset = (prefill_len - 1) * hidden_size;
+        let text_offset = codec_offset + codec_plus_overlay.len();
+        prefill_embd[text_offset..text_offset + text_plus_codec_pad.len()]
+            .copy_from_slice(&text_plus_codec_pad);
+        let final_offset = text_offset + text_plus_codec_pad.len();
         prefill_embd[final_offset..final_offset + hidden_size]
-            .copy_from_slice(&first_text_plus_codec_bos);
+            .copy_from_slice(&tts_pad_plus_codec_bos);
 
-        let trailing_token_count = text_tokens.len().saturating_sub(9);
-        let trailing_text_proj = if trailing_token_count > 0 {
-            text_proj[4 * hidden_size..(4 + trailing_token_count) * hidden_size].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        let trailing_len = trailing_token_count + 1;
-        let mut trailing_text_hidden = vec![0.0f32; trailing_len * hidden_size];
-        if !trailing_text_proj.is_empty() {
-            trailing_text_hidden[..trailing_text_proj.len()].copy_from_slice(&trailing_text_proj);
-        }
-        let trailing_eos_offset = (trailing_len - 1) * hidden_size;
-        trailing_text_hidden[trailing_eos_offset..trailing_eos_offset + hidden_size]
-            .copy_from_slice(&tts_eos_embed);
+        let trailing_text_hidden = tts_pad_embed.clone();
 
         Ok(PreparedPrefillInputs {
             prefill_embd,
@@ -1031,11 +1088,78 @@ impl TtsTransformer {
                 prev_codes,
                 thread_count,
             )?;
-            let token = select_token(&logits, 1.0, temperature, top_k, top_p, &[])?;
+            let token = self.select_code_pred_token(&logits, temperature, top_k, top_p)?;
             codebook_tokens.push(token);
         }
 
         Ok(codebook_tokens)
+    }
+
+    pub fn debug_code_predictor_recompute(
+        &self,
+        hidden_state: &[f32],
+        codebook_0_token: i32,
+        thread_count: usize,
+        top_n: usize,
+    ) -> Result<Vec<CodePredDebugStep>, Qwen3TtsError> {
+        let hidden_size = self.config.hidden_size as usize;
+        if hidden_state.len() != hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor hidden state shape is invalid".into(),
+            ));
+        }
+
+        let mut codebook_tokens = Vec::with_capacity(self.config.n_codebooks as usize);
+        let mut steps = Vec::with_capacity(self.config.n_codebooks.saturating_sub(1) as usize);
+        codebook_tokens.push(codebook_0_token);
+
+        while codebook_tokens.len() < self.config.n_codebooks as usize {
+            let prev_codes = &codebook_tokens[1..];
+            let logits = self.forward_code_pred_sequence_recompute(
+                hidden_state,
+                codebook_0_token,
+                prev_codes,
+                thread_count,
+            )?;
+            let selected_token = self.select_code_pred_token(&logits, 0.0, 0, 1.0)?;
+            let mut top_logits = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(token, logit)| CodePredTopLogit {
+                    token: token as i32,
+                    logit,
+                })
+                .collect::<Vec<_>>();
+            top_logits.sort_by(|a, b| {
+                b.logit
+                    .partial_cmp(&a.logit)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.token.cmp(&b.token))
+            });
+            top_logits.truncate(top_n);
+            steps.push(CodePredDebugStep {
+                codebook_index: codebook_tokens.len(),
+                selected_token,
+                top_logits,
+            });
+            codebook_tokens.push(selected_token);
+        }
+
+        Ok(steps)
+    }
+
+    fn select_code_pred_token(
+        &self,
+        logits: &[f32],
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+    ) -> Result<i32, Qwen3TtsError> {
+        if self.config.code_pred_hidden_size != self.config.hidden_size && temperature <= 0.0 {
+            return select_token_stable(logits, CUSTOMVOICE_GREEDY_STABILITY_EPS);
+        }
+        select_token(logits, 1.0, temperature, top_k, top_p, &[])
     }
 
     pub fn predict_remaining_codebooks_kv(
@@ -1074,6 +1198,29 @@ impl TtsTransformer {
         top_p: f32,
         cache: &CodePredKvCache,
     ) -> Result<Vec<i32>, Qwen3TtsError> {
+        if self.config.code_pred_hidden_size != self.config.hidden_size
+            && self.code_pred._backends.primary_kind() == BackendKind::Cpu
+        {
+            if let Some(cpu) = self.code_pred.cpu.as_ref() {
+                return self.predict_remaining_codebooks_cpu_cached(
+                    cpu,
+                    hidden_state,
+                    codebook_0_token,
+                    thread_count,
+                    temperature,
+                    top_k,
+                    top_p,
+                );
+            }
+            return self.predict_remaining_codebooks_recompute(
+                hidden_state,
+                codebook_0_token,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+            );
+        }
         let hidden_size = self.config.hidden_size as usize;
         if hidden_state.len() != hidden_size {
             return Err(Qwen3TtsError::InvalidInput(
@@ -1090,13 +1237,11 @@ impl TtsTransformer {
             thread_count,
             cache,
         )?;
-        codebook_tokens.push(select_token(
+        codebook_tokens.push(self.select_code_pred_token(
             &first.logits,
-            1.0,
             temperature,
             top_k,
             top_p,
-            &[],
         )?);
 
         while codebook_tokens.len() < self.config.n_codebooks as usize {
@@ -1111,13 +1256,131 @@ impl TtsTransformer {
                 thread_count,
                 cache,
             )?;
-            codebook_tokens.push(select_token(
+            codebook_tokens.push(self.select_code_pred_token(
                 &outputs.logits,
-                1.0,
                 temperature,
                 top_k,
                 top_p,
-                &[],
+            )?);
+        }
+
+        Ok(codebook_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_remaining_codebooks_cpu_cached(
+        &self,
+        cpu: &CodePredCpuWeights,
+        hidden_state: &[f32],
+        codebook_0_token: i32,
+        thread_count: usize,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+    ) -> Result<Vec<i32>, Qwen3TtsError> {
+        let code_pred_thread_count = thread_count.min(4);
+        let talker_hidden_size = self.config.hidden_size as usize;
+        if hidden_state.len() != talker_hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor hidden state shape is invalid".into(),
+            ));
+        }
+
+        let n_codebooks = self.config.n_codebooks as usize;
+        let mut workspace = CodePredCpuWorkspace::new(&self.config, cpu, n_codebooks + 1);
+        self.predict_remaining_codebooks_cpu_cached_with_workspace(
+            cpu,
+            hidden_state,
+            codebook_0_token,
+            code_pred_thread_count,
+            temperature,
+            top_k,
+            top_p,
+            &mut workspace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_remaining_codebooks_cpu_cached_with_workspace(
+        &self,
+        cpu: &CodePredCpuWeights,
+        hidden_state: &[f32],
+        codebook_0_token: i32,
+        thread_count: usize,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        workspace: &mut CodePredCpuWorkspace,
+    ) -> Result<Vec<i32>, Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        if hidden_state.len() != talker_hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor hidden state shape is invalid".into(),
+            ));
+        }
+
+        let n_codebooks = self.config.n_codebooks as usize;
+        workspace.reset();
+        self.project_code_pred_cpu_input(cpu, hidden_state, &mut workspace.projected)?;
+        self.forward_code_pred_token_cpu_cached(
+            cpu,
+            &workspace.projected,
+            0,
+            None,
+            thread_count,
+            &mut workspace.cache,
+            &mut workspace.scratch,
+        )?;
+
+        let cb0 = self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?;
+        self.project_code_pred_cpu_input(cpu, &cb0, &mut workspace.projected)?;
+        let first = self.forward_code_pred_token_cpu_cached(
+            cpu,
+            &workspace.projected,
+            1,
+            Some(0),
+            thread_count,
+            &mut workspace.cache,
+            &mut workspace.scratch,
+        )?;
+        let mut codebook_tokens = Vec::with_capacity(n_codebooks);
+        codebook_tokens.push(codebook_0_token);
+        codebook_tokens.push(self.select_code_pred_token(
+            first.as_deref().ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("missing code predictor logits".into())
+            })?,
+            temperature,
+            top_k,
+            top_p,
+        )?);
+
+        while codebook_tokens.len() < n_codebooks {
+            let generation_step = codebook_tokens.len() - 1;
+            let prev_code = *codebook_tokens.last().ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("code predictor lost previous code".into())
+            })?;
+            self.project_code_pred_cpu_code_embedding(
+                cpu,
+                generation_step - 1,
+                prev_code,
+                &mut workspace.projected,
+            )?;
+            let outputs = self.forward_code_pred_token_cpu_cached(
+                cpu,
+                &workspace.projected,
+                generation_step + 1,
+                Some(generation_step),
+                thread_count,
+                &mut workspace.cache,
+                &mut workspace.scratch,
+            )?;
+            codebook_tokens.push(self.select_code_pred_token(
+                outputs.as_deref().ok_or_else(|| {
+                    Qwen3TtsError::InvalidInput("missing code predictor logits".into())
+                })?,
+                temperature,
+                top_k,
+                top_p,
             )?);
         }
 
@@ -1198,6 +1461,8 @@ impl TtsTransformer {
                 frames: Vec::new(),
                 first_frame_elapsed: Duration::ZERO,
                 sub_timings: CodecRolloutSubTimings::default(),
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
         let t_rollout_start = Instant::now();
@@ -1228,6 +1493,8 @@ impl TtsTransformer {
                     })
                     .collect(),
                 sub_timings: CodecRolloutSubTimings::default(),
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
         let first = SelectedCodecFrame {
@@ -1266,8 +1533,10 @@ impl TtsTransformer {
             ));
         }
         let trailing_len = trailing_text_hidden.len() / hidden_size;
+        let mut debug_step_embeddings = Vec::new();
+        let mut debug_trailing_rows = Vec::new();
 
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let prev_token = frames
@@ -1295,6 +1564,10 @@ impl TtsTransformer {
                 trailing_row,
                 thread_count,
             )?;
+            if debug_step_embeddings.len() < 2 {
+                debug_trailing_rows.push(trailing_row.to_vec());
+                debug_step_embeddings.push(step_embd.clone());
+            }
             let (next_history, next_frame) = self.generate_next_codec_frame_recompute(
                 &history_embd,
                 &step_embd,
@@ -1316,6 +1589,8 @@ impl TtsTransformer {
             frames,
             first_frame_elapsed,
             sub_timings: CodecRolloutSubTimings::default(),
+            debug_step_embeddings,
+            debug_trailing_rows,
         })
     }
 
@@ -1334,14 +1609,50 @@ impl TtsTransformer {
         top_k: i32,
         top_p: f32,
     ) -> Result<CodecRollout, Qwen3TtsError> {
+        self.rollout_codec_frames_kv_with_progress(
+            prefill_embd,
+            trailing_text_hidden,
+            tts_pad_embed,
+            prompt_frames,
+            talker_kv_mode,
+            thread_count,
+            max_frames,
+            repetition_penalty,
+            temperature,
+            top_k,
+            top_p,
+            &mut |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rollout_codec_frames_kv_with_progress(
+        &self,
+        prefill_embd: &[f32],
+        trailing_text_hidden: &[f32],
+        tts_pad_embed: &[f32],
+        prompt_frames: &[Vec<i32>],
+        talker_kv_mode: TalkerKvMode,
+        thread_count: usize,
+        max_frames: usize,
+        repetition_penalty: f32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        progress: &mut dyn FnMut(SynthesisProgress),
+    ) -> Result<CodecRollout, Qwen3TtsError> {
         if max_frames == 0 {
+            progress(SynthesisProgress::rollout(0, 0));
             return Ok(CodecRollout {
                 frames: Vec::new(),
                 first_frame_elapsed: Duration::ZERO,
                 sub_timings: CodecRolloutSubTimings::default(),
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
         let t_rollout_start = Instant::now();
+        progress(SynthesisProgress::rollout(0, max_frames));
 
         let hidden_size = self.config.hidden_size as usize;
         if prefill_embd.is_empty() || !prefill_embd.len().is_multiple_of(hidden_size) {
@@ -1377,6 +1688,10 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
+        let code_pred_thread_count = thread_count.min(4);
+        let mut cpu_code_pred_workspace = self.code_pred.cpu.as_ref().map(|cpu| {
+            CodePredCpuWorkspace::new(&self.config, cpu, self.config.n_codebooks as usize + 1)
+        });
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1399,6 +1714,7 @@ impl TtsTransformer {
             &prompt_recent_tokens,
         )?;
         if first_codebook_0 == self.config.codec_eos_id {
+            progress(SynthesisProgress::rollout(0, max_frames));
             return Ok(CodecRollout {
                 first_frame_elapsed: t_rollout_start.elapsed(),
                 frames: prompt_frames
@@ -1415,20 +1731,38 @@ impl TtsTransformer {
                     talker_kv_bytes: cache.total_bytes(),
                     ..Default::default()
                 },
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
-            &first_outputs.hidden_state,
-            first_codebook_0,
-            thread_count,
-            temperature,
-            top_k,
-            top_p,
-            &code_pred_cache,
-        )?;
+        let first_codes = if let (Some(cpu), Some(workspace)) = (
+            self.code_pred.cpu.as_ref(),
+            cpu_code_pred_workspace.as_mut(),
+        ) {
+            self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                cpu,
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                code_pred_thread_count,
+                temperature,
+                top_k,
+                top_p,
+                workspace,
+            )?
+        } else {
+            self.predict_remaining_codebooks_kv_with_cache(
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+                &code_pred_cache,
+            )?
+        };
         code_pred_dur += t_cp.elapsed();
 
         let mut frames = prompt_frames
@@ -1447,6 +1781,7 @@ impl TtsTransformer {
             logits,
         });
         let first_frame_elapsed = t_rollout_start.elapsed();
+        progress(SynthesisProgress::rollout(1, max_frames));
         let mut n_past = prefill_len;
 
         let mut talker_steps_dur = Duration::ZERO;
@@ -1454,8 +1789,10 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
+        let mut debug_step_embeddings = Vec::new();
+        let mut debug_trailing_rows = Vec::new();
 
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);
@@ -1474,6 +1811,10 @@ impl TtsTransformer {
                 trailing_row,
                 thread_count,
             )?;
+            if debug_step_embeddings.len() < 2 {
+                debug_trailing_rows.push(trailing_row.to_vec());
+                debug_step_embeddings.push(step_embd.clone());
+            }
             let t_step = Instant::now();
             let step_outputs =
                 self.forward_step_cached(&step_embd, n_past, thread_count, &cache)?;
@@ -1502,15 +1843,31 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = self.predict_remaining_codebooks_kv_with_cache(
-                &step_outputs.hidden_state,
-                codebook_0_token,
-                thread_count,
-                temperature,
-                top_k,
-                top_p,
-                &code_pred_cache,
-            )?;
+            let codebook_tokens = if let (Some(cpu), Some(workspace)) = (
+                self.code_pred.cpu.as_ref(),
+                cpu_code_pred_workspace.as_mut(),
+            ) {
+                self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                    cpu,
+                    &step_outputs.hidden_state,
+                    codebook_0_token,
+                    code_pred_thread_count,
+                    temperature,
+                    top_k,
+                    top_p,
+                    workspace,
+                )?
+            } else {
+                self.predict_remaining_codebooks_kv_with_cache(
+                    &step_outputs.hidden_state,
+                    codebook_0_token,
+                    thread_count,
+                    temperature,
+                    top_k,
+                    top_p,
+                    &code_pred_cache,
+                )?
+            };
             code_pred_dur += t_cp.elapsed();
 
             frames.push(SelectedCodecFrame {
@@ -1519,6 +1876,10 @@ impl TtsTransformer {
                 hidden_state: step_outputs.hidden_state,
                 logits,
             });
+            progress(SynthesisProgress::rollout(
+                frames.len().saturating_sub(prompt_frames.len()),
+                max_frames,
+            ));
             n_past += 1;
         }
 
@@ -1535,6 +1896,8 @@ impl TtsTransformer {
                 kv_upload: kv_upload_dur,
                 talker_kv_bytes: cache.total_bytes(),
             },
+            debug_step_embeddings,
+            debug_trailing_rows,
         })
     }
 
@@ -1562,6 +1925,8 @@ impl TtsTransformer {
                 frames: Vec::new(),
                 first_frame_elapsed: Duration::ZERO,
                 sub_timings: CodecRolloutSubTimings::default(),
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
         let t_rollout_start = Instant::now();
@@ -1600,6 +1965,10 @@ impl TtsTransformer {
             self.config.n_codebooks as usize,
             self.code_pred._backends.clone(),
         )?;
+        let code_pred_thread_count = thread_count.min(4);
+        let mut cpu_code_pred_workspace = self.code_pred.cpu.as_ref().map(|cpu| {
+            CodePredCpuWorkspace::new(&self.config, cpu, self.config.n_codebooks as usize + 1)
+        });
 
         let t_prefill = Instant::now();
         let first_outputs = self.forward_prefill_cached(prefill_embd, thread_count, &cache)?;
@@ -1638,20 +2007,38 @@ impl TtsTransformer {
                     talker_kv_bytes: cache.total_bytes(),
                     ..Default::default()
                 },
+                debug_step_embeddings: Vec::new(),
+                debug_trailing_rows: Vec::new(),
             });
         }
 
         let mut code_pred_dur = Duration::ZERO;
         let t_cp = Instant::now();
-        let first_codes = self.predict_remaining_codebooks_kv_with_cache(
-            &first_outputs.hidden_state,
-            first_codebook_0,
-            thread_count,
-            temperature,
-            top_k,
-            top_p,
-            &code_pred_cache,
-        )?;
+        let first_codes = if let (Some(cpu), Some(workspace)) = (
+            self.code_pred.cpu.as_ref(),
+            cpu_code_pred_workspace.as_mut(),
+        ) {
+            self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                cpu,
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                code_pred_thread_count,
+                temperature,
+                top_k,
+                top_p,
+                workspace,
+            )?
+        } else {
+            self.predict_remaining_codebooks_kv_with_cache(
+                &first_outputs.hidden_state,
+                first_codebook_0,
+                thread_count,
+                temperature,
+                top_k,
+                top_p,
+                &code_pred_cache,
+            )?
+        };
         code_pred_dur += t_cp.elapsed();
 
         let mut frames = prompt_frames
@@ -1699,8 +2086,7 @@ impl TtsTransformer {
         let mut kv_download_dur = Duration::ZERO;
         let mut kv_quantize_dur = Duration::ZERO;
         let mut kv_upload_dur = Duration::ZERO;
-
-        while frames.len() < max_frames {
+        while frames.len().saturating_sub(prompt_frames.len()) < max_frames {
             let generated_frames = frames.len().saturating_sub(prompt_frames.len());
             let recent_tokens = Self::recent_codebook0_tokens_from_frames(&frames);
             let trailing_idx = generated_frames.saturating_sub(1);
@@ -1747,15 +2133,31 @@ impl TtsTransformer {
                 break;
             }
             let t_cp = Instant::now();
-            let codebook_tokens = self.predict_remaining_codebooks_kv_with_cache(
-                &step_outputs.hidden_state,
-                codebook_0_token,
-                thread_count,
-                temperature,
-                top_k,
-                top_p,
-                &code_pred_cache,
-            )?;
+            let codebook_tokens = if let (Some(cpu), Some(workspace)) = (
+                self.code_pred.cpu.as_ref(),
+                cpu_code_pred_workspace.as_mut(),
+            ) {
+                self.predict_remaining_codebooks_cpu_cached_with_workspace(
+                    cpu,
+                    &step_outputs.hidden_state,
+                    codebook_0_token,
+                    code_pred_thread_count,
+                    temperature,
+                    top_k,
+                    top_p,
+                    workspace,
+                )?
+            } else {
+                self.predict_remaining_codebooks_kv_with_cache(
+                    &step_outputs.hidden_state,
+                    codebook_0_token,
+                    thread_count,
+                    temperature,
+                    top_k,
+                    top_p,
+                    &code_pred_cache,
+                )?
+            };
             code_pred_dur += t_cp.elapsed();
 
             frames.push(SelectedCodecFrame {
@@ -1790,6 +2192,8 @@ impl TtsTransformer {
                 kv_upload: kv_upload_dur,
                 talker_kv_bytes: cache.total_bytes(),
             },
+            debug_step_embeddings: Vec::new(),
+            debug_trailing_rows: Vec::new(),
         })
     }
 
@@ -1959,6 +2363,14 @@ impl TtsTransformer {
         Ok(data)
     }
 
+    pub fn lookup_codec_embedding_row(
+        &self,
+        token_id: i32,
+        thread_count: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        self.lookup_codec_embedding_rows(&[token_id], thread_count)
+    }
+
     fn sum_codec_frame_embeddings(
         &self,
         codebook_tokens: &[i32],
@@ -1967,32 +2379,34 @@ impl TtsTransformer {
         self.validate_codebook_frame(codebook_tokens)?;
         let hidden_size = self.config.hidden_size as usize;
 
-        if let (Some(codec_table), Some(pred_tables)) = (
-            self.talker.codec_embd_cpu.as_ref(),
-            self.code_pred.codec_embd_cpu.as_ref(),
-        ) {
-            let expected_pred = codebook_tokens.len().saturating_sub(1);
-            if pred_tables.len() == expected_pred {
-                let mut out = vec![0.0f32; hidden_size];
-                let token0 = codebook_tokens[0] as usize;
-                let row0 = token0 * hidden_size..(token0 + 1) * hidden_size;
-                if row0.end <= codec_table.len() {
-                    out.copy_from_slice(&codec_table[row0]);
-                    let mut cpu_ok = true;
-                    for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
-                        let tok = token as usize;
-                        let row = tok * hidden_size..(tok + 1) * hidden_size;
-                        let table = &pred_tables[cb_idx];
-                        if row.end > table.len() {
-                            cpu_ok = false;
-                            break;
+        if self.config.code_pred_hidden_size == self.config.hidden_size {
+            if let (Some(codec_table), Some(pred_tables)) = (
+                self.talker.codec_embd_cpu.as_ref(),
+                self.code_pred.codec_embd_cpu.as_ref(),
+            ) {
+                let expected_pred = codebook_tokens.len().saturating_sub(1);
+                if pred_tables.len() == expected_pred {
+                    let mut out = vec![0.0f32; hidden_size];
+                    let token0 = codebook_tokens[0] as usize;
+                    let row0 = token0 * hidden_size..(token0 + 1) * hidden_size;
+                    if row0.end <= codec_table.len() {
+                        out.copy_from_slice(&codec_table[row0]);
+                        let mut cpu_ok = true;
+                        for (cb_idx, &token) in codebook_tokens[1..].iter().enumerate() {
+                            let tok = token as usize;
+                            let row = tok * hidden_size..(tok + 1) * hidden_size;
+                            let table = &pred_tables[cb_idx];
+                            if row.end > table.len() {
+                                cpu_ok = false;
+                                break;
+                            }
+                            for i in 0..hidden_size {
+                                out[i] += table[row.start + i];
+                            }
                         }
-                        for i in 0..hidden_size {
-                            out[i] += table[row.start + i];
+                        if cpu_ok {
+                            return Ok(out);
                         }
-                    }
-                    if cpu_ok {
-                        return Ok(out);
                     }
                 }
             }
@@ -2015,8 +2429,19 @@ impl TtsTransformer {
         prev_codes: &[i32],
         thread_count: usize,
     ) -> Result<Vec<f32>, Qwen3TtsError> {
-        let hidden_size = self.config.hidden_size as usize;
-        if hidden_state.len() != hidden_size {
+        if let Some(cpu) = self.code_pred.cpu.as_ref() {
+            return self.forward_code_pred_sequence_cpu(
+                cpu,
+                hidden_state,
+                codebook_0_token,
+                prev_codes,
+                thread_count,
+            );
+        }
+
+        let talker_hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        if hidden_state.len() != talker_hidden_size {
             return Err(Qwen3TtsError::InvalidInput(
                 "code predictor hidden state shape is invalid".into(),
             ));
@@ -2027,7 +2452,7 @@ impl TtsTransformer {
             ));
         }
 
-        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * hidden_size);
+        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
         sequence_embd.extend_from_slice(hidden_state);
         sequence_embd.extend_from_slice(
             &self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?,
@@ -2040,7 +2465,9 @@ impl TtsTransformer {
             )?);
         }
 
-        let n_tokens = sequence_embd.len() / hidden_size;
+        let n_tokens = sequence_embd.len() / talker_hidden_size;
+        let projected_sequence =
+            self.project_code_pred_input_if_needed(&sequence_embd, n_tokens, thread_count)?;
         let graph_nodes = 2048;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
@@ -2052,7 +2479,7 @@ impl TtsTransformer {
             sys::ggml_new_tensor_2d(
                 ctx.as_ptr(),
                 sys::ggml_type_GGML_TYPE_F32,
-                hidden_size as i64,
+                code_pred_hidden_size as i64,
                 n_tokens as i64,
             )
         };
@@ -2208,7 +2635,7 @@ impl TtsTransformer {
             sys::ggml_view_2d(
                 ctx.as_ptr(),
                 cur,
-                hidden_size as i64,
+                code_pred_hidden_size as i64,
                 1,
                 (*cur).nb[1],
                 (n_tokens - 1) * (*cur).nb[1],
@@ -2229,7 +2656,7 @@ impl TtsTransformer {
         let mut uploads = vec![
             TensorUpload {
                 tensor: inp_embd.as_ptr(),
-                bytes: slice_as_bytes(sequence_embd.as_slice()),
+                bytes: slice_as_bytes(projected_sequence.as_slice()),
             },
             TensorUpload {
                 tensor: inp_pos.as_ptr(),
@@ -2256,6 +2683,450 @@ impl TtsTransformer {
         Ok(logits_data)
     }
 
+    fn forward_code_pred_sequence_cpu(
+        &self,
+        cpu: &CodePredCpuWeights,
+        hidden_state: &[f32],
+        codebook_0_token: i32,
+        prev_codes: &[i32],
+        thread_count: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        let head_dim = self.config.head_dim as usize;
+        let n_heads = self.config.n_attention_heads as usize;
+        let n_kv_heads = self.config.n_key_value_heads as usize;
+        let vocab = self.config.code_pred_vocab_size as usize;
+        if hidden_state.len() != talker_hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor hidden state shape is invalid".into(),
+            ));
+        }
+        if prev_codes.len() >= self.config.n_codebooks as usize {
+            return Err(Qwen3TtsError::InvalidInput(
+                "too many previous code predictor tokens".into(),
+            ));
+        }
+
+        let mut sequence_embd = Vec::with_capacity((2 + prev_codes.len()) * talker_hidden_size);
+        sequence_embd.extend_from_slice(hidden_state);
+        sequence_embd.extend_from_slice(
+            &self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?,
+        );
+        for (cb_idx, &token) in prev_codes.iter().enumerate() {
+            let table = cpu.embeddings.get(cb_idx).ok_or_else(|| {
+                Qwen3TtsError::InvalidInput("missing CPU code predictor embedding".into())
+            })?;
+            let offset = token as usize * talker_hidden_size;
+            if token < 0 || offset + talker_hidden_size > table.len() {
+                return Err(Qwen3TtsError::InvalidInput(
+                    "code predictor token out of range".into(),
+                ));
+            }
+            sequence_embd.extend_from_slice(&table[offset..offset + talker_hidden_size]);
+        }
+
+        let n_tokens = sequence_embd.len() / talker_hidden_size;
+        let mut x = vec![0.0f32; n_tokens * code_pred_hidden_size];
+        for token_idx in 0..n_tokens {
+            let input = &sequence_embd
+                [token_idx * talker_hidden_size..(token_idx + 1) * talker_hidden_size];
+            let out =
+                &mut x[token_idx * code_pred_hidden_size..(token_idx + 1) * code_pred_hidden_size];
+            linear_cpu(
+                input,
+                &cpu.input_proj_weight,
+                cpu.input_proj_bias.as_slice(),
+                talker_hidden_size,
+                code_pred_hidden_size,
+                out,
+            );
+        }
+
+        let mut q = vec![0.0f32; n_tokens * n_heads * head_dim];
+        let mut k = vec![0.0f32; n_tokens * n_kv_heads * head_dim];
+        let mut v = vec![0.0f32; n_tokens * n_kv_heads * head_dim];
+        let mut attn_out = vec![0.0f32; n_tokens * n_heads * head_dim];
+        let mut tmp = vec![0.0f32; n_tokens * code_pred_hidden_size];
+        let intermediate = cpu
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.len() / code_pred_hidden_size)
+            .unwrap_or(0);
+        let mut gate = vec![0.0f32; n_tokens * intermediate];
+        let mut up = vec![0.0f32; gate.len()];
+        let mut ffn = vec![0.0f32; n_tokens * code_pred_hidden_size];
+
+        for layer in &cpu.layers {
+            rms_norm_rows_cpu(
+                &x,
+                &layer.attn_norm,
+                n_tokens,
+                code_pred_hidden_size,
+                self.config.rms_norm_eps,
+                &mut tmp,
+            );
+            matmul_rows_cpu(
+                &tmp,
+                &layer.attn_q,
+                n_tokens,
+                code_pred_hidden_size,
+                n_heads * head_dim,
+                &mut q,
+                thread_count,
+            );
+            matmul_rows_cpu(
+                &tmp,
+                &layer.attn_k,
+                n_tokens,
+                code_pred_hidden_size,
+                n_kv_heads * head_dim,
+                &mut k,
+                thread_count,
+            );
+            matmul_rows_cpu(
+                &tmp,
+                &layer.attn_v,
+                n_tokens,
+                code_pred_hidden_size,
+                n_kv_heads * head_dim,
+                &mut v,
+                thread_count,
+            );
+            rms_norm_rows_in_place_cpu(
+                &mut q,
+                &layer.attn_q_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            rms_norm_rows_in_place_cpu(
+                &mut k,
+                &layer.attn_k_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            apply_rope_in_place_cpu(&mut q, n_tokens, n_heads, head_dim, self.config.rope_theta);
+            apply_rope_in_place_cpu(
+                &mut k,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
+            attention_cpu(
+                &q,
+                &k,
+                &v,
+                n_tokens,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                &mut attn_out,
+            );
+            matmul_rows_cpu(
+                &attn_out,
+                &layer.attn_output,
+                n_tokens,
+                n_heads * head_dim,
+                code_pred_hidden_size,
+                &mut tmp,
+                thread_count,
+            );
+            for (dst, add) in x.iter_mut().zip(&tmp) {
+                *dst += *add;
+            }
+
+            rms_norm_rows_cpu(
+                &x,
+                &layer.ffn_norm,
+                n_tokens,
+                code_pred_hidden_size,
+                self.config.rms_norm_eps,
+                &mut tmp,
+            );
+            matmul_rows_cpu(
+                &tmp,
+                &layer.ffn_gate,
+                n_tokens,
+                code_pred_hidden_size,
+                intermediate,
+                &mut gate,
+                thread_count,
+            );
+            matmul_rows_cpu(
+                &tmp,
+                &layer.ffn_up,
+                n_tokens,
+                code_pred_hidden_size,
+                intermediate,
+                &mut up,
+                thread_count,
+            );
+            for (g, u) in gate.iter_mut().zip(&up) {
+                *g = silu(*g) * *u;
+            }
+            matmul_rows_cpu(
+                &gate,
+                &layer.ffn_down,
+                n_tokens,
+                intermediate,
+                code_pred_hidden_size,
+                &mut ffn,
+                thread_count,
+            );
+            for (dst, add) in x.iter_mut().zip(&ffn) {
+                *dst += *add;
+            }
+        }
+
+        rms_norm_rows_cpu(
+            &x,
+            &cpu.output_norm,
+            n_tokens,
+            code_pred_hidden_size,
+            self.config.rms_norm_eps,
+            &mut tmp,
+        );
+        let last = &tmp[(n_tokens - 1) * code_pred_hidden_size..n_tokens * code_pred_hidden_size];
+        let head = cpu
+            .heads
+            .get(prev_codes.len())
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("missing code predictor head".into()))?;
+        let mut logits = vec![0.0f32; vocab];
+        linear_no_bias_cpu(
+            last,
+            head,
+            code_pred_hidden_size,
+            vocab,
+            &mut logits,
+            thread_count,
+        );
+        Ok(logits)
+    }
+
+    fn project_code_pred_cpu_input(
+        &self,
+        cpu: &CodePredCpuWeights,
+        input: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        if input.len() != talker_hidden_size || out.len() != code_pred_hidden_size {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor projection shape is invalid".into(),
+            ));
+        }
+        linear_cpu(
+            input,
+            &cpu.input_proj_weight,
+            cpu.input_proj_bias.as_slice(),
+            talker_hidden_size,
+            code_pred_hidden_size,
+            out,
+        );
+        Ok(())
+    }
+
+    fn project_code_pred_cpu_code_embedding(
+        &self,
+        cpu: &CodePredCpuWeights,
+        cb_idx: usize,
+        token_id: i32,
+        out: &mut [f32],
+    ) -> Result<(), Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        if token_id >= 0 {
+            let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+            if let Some(tables) = cpu.projected_embeddings.as_ref() {
+                if let Some(table) = tables.get(cb_idx) {
+                    let offset = token_id as usize * code_pred_hidden_size;
+                    if offset + code_pred_hidden_size <= table.len()
+                        && out.len() == code_pred_hidden_size
+                    {
+                        out.copy_from_slice(&table[offset..offset + code_pred_hidden_size]);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let table = cpu.embeddings.get(cb_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("missing CPU code predictor embedding".into())
+        })?;
+        let offset = token_id as usize * talker_hidden_size;
+        if token_id < 0 || offset + talker_hidden_size > table.len() {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor token out of range".into(),
+            ));
+        }
+        self.project_code_pred_cpu_input(cpu, &table[offset..offset + talker_hidden_size], out)
+    }
+
+    fn forward_code_pred_token_cpu_cached(
+        &self,
+        cpu: &CodePredCpuWeights,
+        projected_input: &[f32],
+        pos: usize,
+        head_idx: Option<usize>,
+        thread_count: usize,
+        cache: &mut CodePredCpuKvCache,
+        scratch: &mut CodePredCpuScratch,
+    ) -> Result<Option<Vec<f32>>, Qwen3TtsError> {
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        let head_dim = self.config.head_dim as usize;
+        let n_heads = self.config.n_attention_heads as usize;
+        let n_kv_heads = self.config.n_key_value_heads as usize;
+        let kv_group = n_heads / n_kv_heads;
+        let intermediate = cpu
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.len() / code_pred_hidden_size)
+            .unwrap_or(0);
+        if projected_input.len() != code_pred_hidden_size || pos >= cache.n_ctx {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor cached token shape is invalid".into(),
+            ));
+        }
+
+        scratch.x.copy_from_slice(projected_input);
+
+        for (layer_idx, layer) in cpu.layers.iter().enumerate() {
+            rms_norm_one_cpu(
+                &scratch.x,
+                &layer.attn_norm,
+                code_pred_hidden_size,
+                self.config.rms_norm_eps,
+                &mut scratch.tmp,
+            );
+            linear_no_bias_cpu(
+                &scratch.tmp,
+                &layer.attn_qkv,
+                code_pred_hidden_size,
+                scratch.qkv.len(),
+                &mut scratch.qkv,
+                thread_count,
+            );
+            let q_len = n_heads * head_dim;
+            let kv_len = n_kv_heads * head_dim;
+            scratch.q.copy_from_slice(&scratch.qkv[..q_len]);
+            scratch
+                .k
+                .copy_from_slice(&scratch.qkv[q_len..q_len + kv_len]);
+            scratch
+                .v
+                .copy_from_slice(&scratch.qkv[q_len + kv_len..q_len + kv_len * 2]);
+            rms_norm_rows_in_place_cpu(
+                &mut scratch.q,
+                &layer.attn_q_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            rms_norm_rows_in_place_cpu(
+                &mut scratch.k,
+                &layer.attn_k_norm,
+                head_dim,
+                self.config.rms_norm_eps,
+            );
+            apply_rope_single_in_place_cpu(
+                &mut scratch.q,
+                pos,
+                n_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
+            apply_rope_single_in_place_cpu(
+                &mut scratch.k,
+                pos,
+                n_kv_heads,
+                head_dim,
+                self.config.rope_theta,
+            );
+
+            cache.write(layer_idx, pos, &scratch.k, &scratch.v)?;
+            attention_single_cpu(
+                &scratch.q,
+                &cache.k[layer_idx],
+                &cache.v[layer_idx],
+                pos + 1,
+                n_heads,
+                n_kv_heads,
+                kv_group,
+                head_dim,
+                cache.n_ctx,
+                &mut scratch.attn_out,
+            );
+            linear_no_bias_cpu(
+                &scratch.attn_out,
+                &layer.attn_output,
+                n_heads * head_dim,
+                code_pred_hidden_size,
+                &mut scratch.tmp,
+                thread_count,
+            );
+            for (dst, add) in scratch.x.iter_mut().zip(&scratch.tmp) {
+                *dst += *add;
+            }
+
+            rms_norm_one_cpu(
+                &scratch.x,
+                &layer.ffn_norm,
+                code_pred_hidden_size,
+                self.config.rms_norm_eps,
+                &mut scratch.tmp,
+            );
+            linear_no_bias_cpu(
+                &scratch.tmp,
+                &layer.ffn_gate_up,
+                code_pred_hidden_size,
+                intermediate * 2,
+                &mut scratch.gate_up,
+                thread_count,
+            );
+            scratch
+                .gate
+                .copy_from_slice(&scratch.gate_up[..intermediate]);
+            scratch.up.copy_from_slice(&scratch.gate_up[intermediate..]);
+            for (g, u) in scratch.gate.iter_mut().zip(&scratch.up) {
+                *g = silu(*g) * *u;
+            }
+            linear_no_bias_cpu(
+                &scratch.gate,
+                &layer.ffn_down,
+                intermediate,
+                code_pred_hidden_size,
+                &mut scratch.ffn,
+                thread_count,
+            );
+            for (dst, add) in scratch.x.iter_mut().zip(&scratch.ffn) {
+                *dst += *add;
+            }
+        }
+
+        let Some(head_idx) = head_idx else {
+            return Ok(None);
+        };
+        rms_norm_one_cpu(
+            &scratch.x,
+            &cpu.output_norm,
+            code_pred_hidden_size,
+            self.config.rms_norm_eps,
+            &mut scratch.tmp,
+        );
+        let head = cpu
+            .heads
+            .get(head_idx)
+            .ok_or_else(|| Qwen3TtsError::InvalidInput("missing code predictor head".into()))?;
+        linear_no_bias_cpu(
+            &scratch.tmp,
+            head,
+            code_pred_hidden_size,
+            self.config.code_pred_vocab_size as usize,
+            &mut scratch.logits,
+            thread_count,
+        );
+        Ok(Some(scratch.logits.clone()))
+    }
+
     fn lookup_code_pred_embedding_row(
         &self,
         cb_idx: usize,
@@ -2269,10 +3140,26 @@ impl TtsTransformer {
                 cb_idx + 1
             )));
         }
+        let hidden_size = self.config.hidden_size as usize;
+        if let Some(cpu) = self.code_pred.cpu.as_ref() {
+            if let Some(table) = cpu.embeddings.get(cb_idx) {
+                let offset = token_id as usize * hidden_size;
+                if offset + hidden_size <= table.len() {
+                    return Ok(table[offset..offset + hidden_size].to_vec());
+                }
+            }
+        }
         let weight = self.code_pred.embeddings.get(cb_idx).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("missing code predictor embedding".into())
         })?;
-        let hidden_size = self.config.hidden_size as usize;
+        if let Some(tables) = self.code_pred.codec_embd_cpu.as_ref() {
+            if let Some(table) = tables.get(cb_idx) {
+                let offset = token_id as usize * hidden_size;
+                if offset + hidden_size <= table.len() {
+                    return Ok(table[offset..offset + hidden_size].to_vec());
+                }
+            }
+        }
         let graph_nodes = 16;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
@@ -2308,6 +3195,79 @@ impl TtsTransformer {
         Ok(data)
     }
 
+    fn project_code_pred_input_if_needed(
+        &self,
+        input_embd: &[f32],
+        n_tokens: usize,
+        thread_count: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        if input_embd.len() != n_tokens.saturating_mul(talker_hidden_size) {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor input embedding shape is invalid".into(),
+            ));
+        }
+        if code_pred_hidden_size == talker_hidden_size {
+            return Ok(input_embd.to_vec());
+        }
+
+        let weight = self.code_pred.input_proj_weight.ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("missing code predictor input projection weight".into())
+        })?;
+        let bias = self.code_pred.input_proj_bias.ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("missing code predictor input projection bias".into())
+        })?;
+
+        let graph_nodes = 32;
+        let ctx = ComputeContext::new_graph(graph_nodes)?;
+        let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
+        let graph = NonNull::new(graph).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput(
+                "failed to allocate code predictor input projection graph".into(),
+            )
+        })?;
+
+        let inp_embd = unsafe {
+            sys::ggml_new_tensor_2d(
+                ctx.as_ptr(),
+                sys::ggml_type_GGML_TYPE_F32,
+                talker_hidden_size as i64,
+                n_tokens as i64,
+            )
+        };
+        let inp_embd = NonNull::new(inp_embd).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput(
+                "failed to allocate code predictor projected input tensor".into(),
+            )
+        })?;
+
+        let mut cur =
+            unsafe { sys::ggml_mul_mat(ctx.as_ptr(), weight.as_ptr(), inp_embd.as_ptr()) };
+        cur = unsafe { sys::ggml_add(ctx.as_ptr(), cur, bias.as_ptr()) };
+        cur = unsafe { sys::ggml_cast(ctx.as_ptr(), cur, sys::ggml_type_GGML_TYPE_F32) };
+        unsafe {
+            sys::ggml_build_forward_expand(graph.as_ptr(), cur);
+        }
+
+        let mut out = vec![0.0f32; n_tokens * code_pred_hidden_size];
+        execute_graph(
+            &self.code_pred._backends,
+            graph,
+            &[TensorUpload {
+                tensor: inp_embd.as_ptr(),
+                bytes: slice_as_bytes(input_embd),
+            }],
+            &mut [TensorDownload {
+                tensor: cur,
+                bytes: slice_as_bytes_mut(out.as_mut_slice()),
+            }],
+            thread_count,
+            "code predictor input projection graph execution failed",
+        )?;
+        Ok(out)
+    }
+
     fn forward_code_pred_prefill_cached(
         &self,
         hidden_state: &[f32],
@@ -2315,8 +3275,9 @@ impl TtsTransformer {
         thread_count: usize,
         cache: &CodePredKvCache,
     ) -> Result<CodePredStepOutputs, Qwen3TtsError> {
-        let hidden_size = self.config.hidden_size as usize;
-        if hidden_state.len() != hidden_size {
+        let talker_hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
+        if hidden_state.len() != talker_hidden_size {
             return Err(Qwen3TtsError::InvalidInput(
                 "code predictor hidden state shape is invalid".into(),
             ));
@@ -2339,7 +3300,7 @@ impl TtsTransformer {
             sys::ggml_new_tensor_1d(
                 ctx.as_ptr(),
                 sys::ggml_type_GGML_TYPE_F32,
-                hidden_size as i64,
+                code_pred_hidden_size as i64,
             )
         };
         let inp_hidden = NonNull::new(inp_hidden).ok_or_else(|| {
@@ -2350,7 +3311,7 @@ impl TtsTransformer {
             sys::ggml_new_tensor_2d(
                 ctx.as_ptr(),
                 sys::ggml_type_GGML_TYPE_F32,
-                hidden_size as i64,
+                code_pred_hidden_size as i64,
                 1,
             )
         };
@@ -2365,8 +3326,19 @@ impl TtsTransformer {
         })?;
         let positions = [0i32, 1i32];
 
+        let cb0_embd = self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?;
+        let mut projected_inputs = Vec::with_capacity(2 * talker_hidden_size);
+        projected_inputs.extend_from_slice(hidden_state);
+        projected_inputs.extend_from_slice(&cb0_embd);
+        let projected_inputs =
+            self.project_code_pred_input_if_needed(&projected_inputs, 2, thread_count)?;
         let hidden_2d = unsafe {
-            sys::ggml_reshape_2d(ctx.as_ptr(), inp_hidden.as_ptr(), hidden_size as i64, 1)
+            sys::ggml_reshape_2d(
+                ctx.as_ptr(),
+                inp_hidden.as_ptr(),
+                code_pred_hidden_size as i64,
+                1,
+            )
         };
         let mut inp_l =
             unsafe { sys::ggml_concat(ctx.as_ptr(), hidden_2d, inp_cb0_embd.as_ptr(), 1) };
@@ -2539,10 +3511,10 @@ impl TtsTransformer {
             sys::ggml_view_2d(
                 ctx.as_ptr(),
                 cur,
-                hidden_size as i64,
+                code_pred_hidden_size as i64,
                 1,
                 (*cur).nb[1],
-                hidden_size * std::mem::size_of::<f32>(),
+                code_pred_hidden_size * std::mem::size_of::<f32>(),
             )
         };
         let mut logits = unsafe {
@@ -2554,15 +3526,14 @@ impl TtsTransformer {
         }
 
         let mut logits_data = vec![0.0f32; self.config.code_pred_vocab_size as usize];
-        let cb0_embd = self.lookup_codec_embedding_rows(&[codebook_0_token], thread_count)?;
         let mut uploads = vec![
             TensorUpload {
                 tensor: inp_hidden.as_ptr(),
-                bytes: slice_as_bytes(hidden_state),
+                bytes: slice_as_bytes(projected_inputs[..code_pred_hidden_size].as_ref()),
             },
             TensorUpload {
                 tensor: inp_cb0_embd.as_ptr(),
-                bytes: slice_as_bytes(cb0_embd.as_slice()),
+                bytes: slice_as_bytes(projected_inputs[code_pred_hidden_size..].as_ref()),
             },
             TensorUpload {
                 tensor: inp_pos.as_ptr(),
@@ -2610,18 +3581,12 @@ impl TtsTransformer {
             ));
         }
 
-        let hidden_size = self.config.hidden_size as usize;
+        let code_pred_hidden_size = self.config.code_pred_hidden_size as usize;
         let graph_nodes = 2048;
         let ctx = ComputeContext::new_graph(graph_nodes)?;
         let graph = unsafe { sys::ggml_new_graph_custom(ctx.as_ptr(), graph_nodes, false) };
         let graph = NonNull::new(graph).ok_or_else(|| {
             Qwen3TtsError::InvalidInput("failed to allocate code predictor step graph".into())
-        })?;
-
-        let inp_code =
-            unsafe { sys::ggml_new_tensor_1d(ctx.as_ptr(), sys::ggml_type_GGML_TYPE_I32, 1) };
-        let inp_code = NonNull::new(inp_code).ok_or_else(|| {
-            Qwen3TtsError::InvalidInput("failed to allocate code predictor token input".into())
         })?;
 
         let inp_pos =
@@ -2631,16 +3596,22 @@ impl TtsTransformer {
         })?;
         let pos = n_past as i32;
 
-        let weight = self
-            .code_pred
-            .embeddings
-            .get(generation_step - 1)
-            .ok_or_else(|| {
-                Qwen3TtsError::InvalidInput("missing code predictor embedding".into())
-            })?;
-        let mut inp_l =
-            unsafe { sys::ggml_get_rows(ctx.as_ptr(), weight.as_ptr(), inp_code.as_ptr()) };
-        inp_l = unsafe { sys::ggml_reshape_2d(ctx.as_ptr(), inp_l, hidden_size as i64, 1) };
+        let looked_up =
+            self.lookup_code_pred_embedding_row(generation_step - 1, prev_code, thread_count)?;
+        let projected_lookup =
+            self.project_code_pred_input_if_needed(&looked_up, 1, thread_count)?;
+        let inp_code_embd = unsafe {
+            sys::ggml_new_tensor_2d(
+                ctx.as_ptr(),
+                sys::ggml_type_GGML_TYPE_F32,
+                code_pred_hidden_size as i64,
+                1,
+            )
+        };
+        let inp_code_embd = NonNull::new(inp_code_embd).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("failed to allocate code predictor embedding input".into())
+        })?;
+        let mut inp_l = inp_code_embd.as_ptr();
         let kq_scale = 1.0f32 / (self.config.head_dim as f32).sqrt();
         let mut attn_softmax_mask: Option<(*mut sys::ggml_tensor, Vec<f32>)> = None;
 
@@ -2762,30 +3733,42 @@ impl TtsTransformer {
                 );
             }
 
-            let n_kv = n_past + 1;
-            let mut k = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    k_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_kv as i64,
-                    (*k_cache).nb[1],
-                    (*k_cache).nb[2],
-                    0,
-                )
-            };
-            let mut v = unsafe {
-                sys::ggml_view_3d(
-                    ctx.as_ptr(),
-                    v_cache,
-                    self.config.head_dim as i64,
-                    self.config.n_key_value_heads as i64,
-                    n_kv as i64,
-                    (*v_cache).nb[1],
-                    (*v_cache).nb[2],
-                    0,
-                )
+            let (mut k, mut v) = if n_past == 0 {
+                (k_cur, v_cur)
+            } else {
+                let k_prefix_f16 = unsafe {
+                    sys::ggml_view_3d(
+                        ctx.as_ptr(),
+                        k_cache,
+                        self.config.head_dim as i64,
+                        self.config.n_key_value_heads as i64,
+                        n_past as i64,
+                        (*k_cache).nb[1],
+                        (*k_cache).nb[2],
+                        0,
+                    )
+                };
+                let v_prefix_f16 = unsafe {
+                    sys::ggml_view_3d(
+                        ctx.as_ptr(),
+                        v_cache,
+                        self.config.head_dim as i64,
+                        self.config.n_key_value_heads as i64,
+                        n_past as i64,
+                        (*v_cache).nb[1],
+                        (*v_cache).nb[2],
+                        0,
+                    )
+                };
+                let k_prefix = unsafe {
+                    sys::ggml_cast(ctx.as_ptr(), k_prefix_f16, sys::ggml_type_GGML_TYPE_F32)
+                };
+                let v_prefix = unsafe {
+                    sys::ggml_cast(ctx.as_ptr(), v_prefix_f16, sys::ggml_type_GGML_TYPE_F32)
+                };
+                let k = unsafe { sys::ggml_concat(ctx.as_ptr(), k_prefix, k_cur, 2) };
+                let v = unsafe { sys::ggml_concat(ctx.as_ptr(), v_prefix, v_cur, 2) };
+                (k, v)
             };
             let q = unsafe { sys::ggml_permute(ctx.as_ptr(), q_cur, 0, 2, 1, 3) };
             k = unsafe { sys::ggml_permute(ctx.as_ptr(), k, 0, 2, 1, 3) };
@@ -2851,8 +3834,8 @@ impl TtsTransformer {
         let mut logits_data = vec![0.0f32; self.config.code_pred_vocab_size as usize];
         let mut uploads = vec![
             TensorUpload {
-                tensor: inp_code.as_ptr(),
-                bytes: slice_as_bytes(std::slice::from_ref(&prev_code)),
+                tensor: inp_code_embd.as_ptr(),
+                bytes: slice_as_bytes(projected_lookup.as_slice()),
             },
             TensorUpload {
                 tensor: inp_pos.as_ptr(),
@@ -3515,32 +4498,43 @@ impl TtsTransformer {
                         );
                     }
 
-                    let n_kv = n_past + 1;
-                    let k = unsafe {
-                        sys::ggml_view_3d(
-                            ctx.as_ptr(),
-                            k_cache,
-                            self.config.head_dim as i64,
-                            self.config.n_key_value_heads as i64,
-                            n_kv as i64,
-                            (*k_cache).nb[1],
-                            (*k_cache).nb[2],
-                            0,
-                        )
-                    };
-                    let v = unsafe {
-                        sys::ggml_view_3d(
-                            ctx.as_ptr(),
-                            v_cache,
-                            self.config.head_dim as i64,
-                            self.config.n_key_value_heads as i64,
-                            n_kv as i64,
-                            (*v_cache).nb[1],
-                            (*v_cache).nb[2],
-                            0,
-                        )
-                    };
-                    (k, v)
+                    if n_past == 0 {
+                        (k_cur, v_cur)
+                    } else {
+                        let k_prefix_f16 = unsafe {
+                            sys::ggml_view_3d(
+                                ctx.as_ptr(),
+                                k_cache,
+                                self.config.head_dim as i64,
+                                self.config.n_key_value_heads as i64,
+                                n_past as i64,
+                                (*k_cache).nb[1],
+                                (*k_cache).nb[2],
+                                0,
+                            )
+                        };
+                        let v_prefix_f16 = unsafe {
+                            sys::ggml_view_3d(
+                                ctx.as_ptr(),
+                                v_cache,
+                                self.config.head_dim as i64,
+                                self.config.n_key_value_heads as i64,
+                                n_past as i64,
+                                (*v_cache).nb[1],
+                                (*v_cache).nb[2],
+                                0,
+                            )
+                        };
+                        let k_prefix = unsafe {
+                            sys::ggml_cast(ctx.as_ptr(), k_prefix_f16, sys::ggml_type_GGML_TYPE_F32)
+                        };
+                        let v_prefix = unsafe {
+                            sys::ggml_cast(ctx.as_ptr(), v_prefix_f16, sys::ggml_type_GGML_TYPE_F32)
+                        };
+                        let k = unsafe { sys::ggml_concat(ctx.as_ptr(), k_prefix, k_cur, 2) };
+                        let v = unsafe { sys::ggml_concat(ctx.as_ptr(), v_prefix, v_cur, 2) };
+                        (k, v)
+                    }
                 }
                 TalkerKvStorage::TurboQuantQ8_0 => {
                     let k_store = unsafe { sys::ggml_cont(ctx.as_ptr(), k_cur) };
@@ -3816,16 +4810,43 @@ impl TalkerWeights {
         let tensor_count = 8 + cfg.n_layers as usize * 12;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
 
-        let text_embd = load_tensor_into_context(file, ctx.as_ptr(), "talker.text_embd.weight")?;
-        let text_proj_fc1 =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc1.weight")?;
-        let text_proj_fc1_bias =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc1.bias")?;
-        let text_proj_fc2 =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc2.weight")?;
-        let text_proj_fc2_bias =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.text_proj.fc2.bias")?;
-        let codec_embd = load_tensor_into_context(file, ctx.as_ptr(), "talker.codec_embd.weight")?;
+        let force_f32_core = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let text_embd = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_embd.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc1 = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc1.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc1_bias = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc1.bias",
+            force_f32_core,
+        )?;
+        let text_proj_fc2 = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc2.weight",
+            force_f32_core,
+        )?;
+        let text_proj_fc2_bias = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.text_proj.fc2.bias",
+            force_f32_core,
+        )?;
+        let codec_embd = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.codec_embd.weight",
+            force_f32_core,
+        )?;
         let hidden_u = cfg.hidden_size as usize;
         let codec_vocab_u = cfg.codec_vocab_size as usize;
         let codec_embd_cpu = try_read_embedding_matrix_f32(
@@ -3835,65 +4856,89 @@ impl TalkerWeights {
             hidden_u,
             codec_vocab_u,
         );
-        let output_norm =
-            load_tensor_into_context(file, ctx.as_ptr(), "talker.output_norm.weight")?;
-        let codec_head = load_tensor_into_context(file, ctx.as_ptr(), "talker.codec_head.weight")?;
+        let output_norm = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.output_norm.weight",
+            force_f32_core,
+        )?;
+        let codec_head = load_talker_tensor_into_context(
+            file,
+            ctx.as_ptr(),
+            "talker.codec_head.weight",
+            force_f32_core,
+        )?;
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for layer_idx in 0..cfg.n_layers {
             let prefix = format!("talker.blk.{layer_idx}.");
             let ffn_down_name = prefix.clone() + "ffn_down.weight";
             layers.push(TalkerLayerWeights {
-                attn_norm: load_tensor_into_context(
+                attn_norm: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_q_norm: load_optional_tensor_into_context(
+                attn_q_norm: load_optional_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_q_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_k_norm: load_optional_tensor_into_context(
+                attn_k_norm: load_optional_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k_norm.weight"),
+                    force_f32_core,
                 )?,
-                attn_q: load_tensor_into_context(
+                attn_q: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_q.weight"),
+                    force_f32_core,
                 )?,
-                attn_k: load_tensor_into_context(
+                attn_k: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_k.weight"),
+                    force_f32_core,
                 )?,
-                attn_v: load_tensor_into_context(
+                attn_v: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_v.weight"),
+                    force_f32_core,
                 )?,
-                attn_output: load_tensor_into_context(
+                attn_output: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "attn_output.weight"),
+                    force_f32_core,
                 )?,
-                ffn_norm: load_tensor_into_context(
+                ffn_norm: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_norm.weight"),
+                    force_f32_core,
                 )?,
-                ffn_gate: load_tensor_into_context(
+                ffn_gate: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_gate.weight"),
+                    force_f32_core,
                 )?,
-                ffn_up: load_tensor_into_context(
+                ffn_up: load_talker_tensor_into_context(
                     file,
                     ctx.as_ptr(),
                     &(prefix.clone() + "ffn_up.weight"),
+                    force_f32_core,
                 )?,
-                ffn_down: load_tensor_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
+                ffn_down: load_talker_tensor_into_context(
+                    file,
+                    ctx.as_ptr(),
+                    &ffn_down_name,
+                    force_f32_core,
+                )?,
                 ffn_down_f32: load_tensor_f32_into_context(file, ctx.as_ptr(), &ffn_down_name)?,
             });
         }
@@ -3909,10 +4954,7 @@ impl TalkerWeights {
             ("talker.output_norm.weight", output_norm),
             ("talker.codec_head.weight", codec_head),
         ] {
-            let (_, raw) = file.read_tensor_bytes(name)?;
-            unsafe {
-                sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
-            }
+            upload_talker_tensor(file, name, tensor, force_f32_core)?;
         }
         for (layer_idx, layer) in layers.iter().enumerate() {
             for (suffix, tensor) in [
@@ -3930,15 +4972,7 @@ impl TalkerWeights {
             ] {
                 if let Some(tensor) = tensor {
                     let name = format!("talker.blk.{layer_idx}.{suffix}");
-                    let (_, raw) = file.read_tensor_bytes(&name)?;
-                    unsafe {
-                        sys::ggml_backend_tensor_set(
-                            tensor.as_ptr(),
-                            raw.as_ptr().cast(),
-                            0,
-                            raw.len(),
-                        );
-                    }
+                    upload_talker_tensor(file, &name, tensor, force_f32_core)?;
                 }
             }
             if let Some(tensor) = layer.ffn_down_f32 {
@@ -3992,12 +5026,164 @@ struct CodePredWeights {
     _ctx: OwnedContext,
     _backends: BackendSet,
     _buffer: OwnedBuffer,
+    input_proj_weight: Option<NonNull<sys::ggml_tensor>>,
+    input_proj_bias: Option<NonNull<sys::ggml_tensor>>,
+    cpu: Option<CodePredCpuWeights>,
     embeddings: Vec<NonNull<sys::ggml_tensor>>,
     /// Per codebook row-major `[code_pred_vocab_size * hidden_size]`, only when all tables are F16/F32 in GGUF.
     codec_embd_cpu: Option<Vec<Vec<f32>>>,
     output_norm: NonNull<sys::ggml_tensor>,
     heads: Vec<NonNull<sys::ggml_tensor>>,
     layers: Vec<TalkerLayerWeights>,
+}
+
+struct CodePredCpuWeights {
+    input_proj_weight: Vec<f32>,
+    input_proj_bias: Vec<f32>,
+    embeddings: Vec<Vec<f32>>,
+    projected_embeddings: Option<Vec<Vec<f32>>>,
+    output_norm: Vec<f32>,
+    heads: Vec<Vec<f32>>,
+    layers: Vec<CodePredCpuLayerWeights>,
+}
+
+struct CodePredCpuLayerWeights {
+    attn_norm: Vec<f32>,
+    attn_q_norm: Vec<f32>,
+    attn_k_norm: Vec<f32>,
+    attn_q: Vec<f32>,
+    attn_k: Vec<f32>,
+    attn_v: Vec<f32>,
+    attn_qkv: Vec<f32>,
+    attn_output: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    ffn_gate: Vec<f32>,
+    ffn_up: Vec<f32>,
+    ffn_gate_up: Vec<f32>,
+    ffn_down: Vec<f32>,
+}
+
+struct CodePredCpuKvCache {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    n_ctx: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl CodePredCpuKvCache {
+    fn new(n_layers: usize, n_ctx: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        let len = n_ctx * n_kv_heads * head_dim;
+        Self {
+            k: vec![vec![0.0; len]; n_layers],
+            v: vec![vec![0.0; len]; n_layers],
+            n_ctx,
+            n_kv_heads,
+            head_dim,
+        }
+    }
+
+    fn write(
+        &mut self,
+        layer_idx: usize,
+        pos: usize,
+        k_src: &[f32],
+        v_src: &[f32],
+    ) -> Result<(), Qwen3TtsError> {
+        let width = self.n_kv_heads * self.head_dim;
+        if pos >= self.n_ctx || k_src.len() != width || v_src.len() != width {
+            return Err(Qwen3TtsError::InvalidInput(
+                "code predictor CPU KV cache write shape is invalid".into(),
+            ));
+        }
+        let offset = pos * width;
+        let k = self.k.get_mut(layer_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("code predictor CPU K cache layer out of range".into())
+        })?;
+        let v = self.v.get_mut(layer_idx).ok_or_else(|| {
+            Qwen3TtsError::InvalidInput("code predictor CPU V cache layer out of range".into())
+        })?;
+        k[offset..offset + width].copy_from_slice(k_src);
+        v[offset..offset + width].copy_from_slice(v_src);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        for layer in &mut self.k {
+            layer.fill(0.0);
+        }
+        for layer in &mut self.v {
+            layer.fill(0.0);
+        }
+    }
+}
+
+struct CodePredCpuWorkspace {
+    cache: CodePredCpuKvCache,
+    scratch: CodePredCpuScratch,
+    projected: Vec<f32>,
+}
+
+impl CodePredCpuWorkspace {
+    fn new(cfg: &TtsTransformerConfig, cpu: &CodePredCpuWeights, n_ctx: usize) -> Self {
+        Self {
+            cache: CodePredCpuKvCache::new(
+                cpu.layers.len(),
+                n_ctx,
+                cfg.n_key_value_heads as usize,
+                cfg.head_dim as usize,
+            ),
+            scratch: CodePredCpuScratch::new(cfg, cpu),
+            projected: vec![0.0; cfg.code_pred_hidden_size as usize],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cache.clear();
+    }
+}
+
+struct CodePredCpuScratch {
+    x: Vec<f32>,
+    tmp: Vec<f32>,
+    qkv: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn_out: Vec<f32>,
+    gate_up: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl CodePredCpuScratch {
+    fn new(cfg: &TtsTransformerConfig, cpu: &CodePredCpuWeights) -> Self {
+        let code_pred_hidden_size = cfg.code_pred_hidden_size as usize;
+        let head_dim = cfg.head_dim as usize;
+        let n_heads = cfg.n_attention_heads as usize;
+        let n_kv_heads = cfg.n_key_value_heads as usize;
+        let intermediate = cpu
+            .layers
+            .first()
+            .map(|layer| layer.ffn_gate.len() / code_pred_hidden_size)
+            .unwrap_or(0);
+        Self {
+            x: vec![0.0; code_pred_hidden_size],
+            tmp: vec![0.0; code_pred_hidden_size],
+            qkv: vec![0.0; (n_heads + n_kv_heads * 2) * head_dim],
+            q: vec![0.0; n_heads * head_dim],
+            k: vec![0.0; n_kv_heads * head_dim],
+            v: vec![0.0; n_kv_heads * head_dim],
+            attn_out: vec![0.0; n_heads * head_dim],
+            gate_up: vec![0.0; intermediate * 2],
+            gate: vec![0.0; intermediate],
+            up: vec![0.0; intermediate],
+            ffn: vec![0.0; code_pred_hidden_size],
+            logits: vec![0.0; cfg.code_pred_vocab_size as usize],
+        }
+    }
 }
 
 struct TalkerKvCache {
@@ -4274,8 +5460,50 @@ impl CodePredWeights {
             sys::ggml_cpu_init();
         }
         let per_codebook = (cfg.n_codebooks - 1) as usize;
-        let tensor_count = 1 + per_codebook * 2 + cfg.code_pred_layers as usize * 12;
+        let has_input_proj = cfg.code_pred_hidden_size != cfg.hidden_size;
+        let tensor_count = 1
+            + per_codebook * 2
+            + cfg.code_pred_layers as usize * 12
+            + usize::from(has_input_proj) * 2;
         let ctx = OwnedContext::new_for_tensor_metadata(tensor_count)?;
+
+        let input_proj_weight_name = if has_input_proj {
+            Some(existing_tensor_name(
+                file,
+                &[
+                    "code_pred.input_proj.weight",
+                    "code_pred.hidden_proj.weight",
+                ],
+            )?)
+        } else {
+            None
+        };
+        let input_proj_bias_name = if has_input_proj {
+            Some(existing_tensor_name(
+                file,
+                &["code_pred.input_proj.bias", "code_pred.hidden_proj.bias"],
+            )?)
+        } else {
+            None
+        };
+        let input_proj_weight = if has_input_proj {
+            Some(load_tensor_into_context(
+                file,
+                ctx.as_ptr(),
+                input_proj_weight_name.expect("input proj weight name"),
+            )?)
+        } else {
+            None
+        };
+        let input_proj_bias = if has_input_proj {
+            Some(load_tensor_into_context(
+                file,
+                ctx.as_ptr(),
+                input_proj_bias_name.expect("input proj bias name"),
+            )?)
+        } else {
+            None
+        };
 
         let mut embeddings = Vec::with_capacity(per_codebook);
         let mut heads = Vec::with_capacity(per_codebook);
@@ -4309,6 +5537,11 @@ impl CodePredWeights {
         if codec_embd_cpu.as_ref().map(|v| v.len()) != Some(per_codebook) {
             codec_embd_cpu = None;
         }
+        let cpu = if has_input_proj {
+            Some(CodePredCpuWeights::load(file, cfg, per_codebook)?)
+        } else {
+            None
+        };
         let output_norm =
             load_tensor_into_context(file, ctx.as_ptr(), "code_pred.output_norm.weight")?;
         let mut layers = Vec::with_capacity(cfg.code_pred_layers as usize);
@@ -4372,6 +5605,20 @@ impl CodePredWeights {
         }
 
         let buffer = OwnedBuffer::alloc(ctx.as_ptr(), backends.primary_ptr())?;
+        if let Some(tensor) = input_proj_weight {
+            let (_, raw) =
+                file.read_tensor_bytes(input_proj_weight_name.expect("input proj weight name"))?;
+            unsafe {
+                sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+            }
+        }
+        if let Some(tensor) = input_proj_bias {
+            let (_, raw) =
+                file.read_tensor_bytes(input_proj_bias_name.expect("input proj bias name"))?;
+            unsafe {
+                sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+            }
+        }
         for cb_idx in 0..per_codebook {
             for name in [
                 format!("code_pred.codec_embd.{cb_idx}.weight"),
@@ -4442,8 +5689,91 @@ impl CodePredWeights {
             _ctx: ctx,
             _backends: backends,
             _buffer: buffer,
+            input_proj_weight,
+            input_proj_bias,
+            cpu,
             embeddings,
             codec_embd_cpu,
+            output_norm,
+            heads,
+            layers,
+        })
+    }
+}
+
+impl CodePredCpuWeights {
+    fn load(
+        file: &GgufFile,
+        cfg: &TtsTransformerConfig,
+        per_codebook: usize,
+    ) -> Result<Self, Qwen3TtsError> {
+        let input_proj_weight_name = existing_tensor_name(
+            file,
+            &[
+                "code_pred.input_proj.weight",
+                "code_pred.hidden_proj.weight",
+            ],
+        )?;
+        let input_proj_bias_name = existing_tensor_name(
+            file,
+            &["code_pred.input_proj.bias", "code_pred.hidden_proj.bias"],
+        )?;
+        let (_, input_proj_weight) = file.read_tensor_f32(input_proj_weight_name)?;
+        let (_, input_proj_bias) = file.read_tensor_f32(input_proj_bias_name)?;
+        let (_, output_norm) = file.read_tensor_f32("code_pred.output_norm.weight")?;
+        let mut embeddings = Vec::with_capacity(per_codebook);
+        let mut heads = Vec::with_capacity(per_codebook);
+        for cb_idx in 0..per_codebook {
+            let (_, embd) =
+                file.read_tensor_f32(&format!("code_pred.codec_embd.{cb_idx}.weight"))?;
+            embeddings.push(embd);
+            let (_, head) = file.read_tensor_f32(&format!("code_pred.lm_head.{cb_idx}.weight"))?;
+            heads.push(head);
+        }
+        let projected_embeddings =
+            try_read_code_pred_projected_embedding_tables_cpu(file, cfg, per_codebook);
+
+        let mut layers = Vec::with_capacity(cfg.code_pred_layers as usize);
+        for layer_idx in 0..cfg.code_pred_layers {
+            let prefix = format!("code_pred.blk.{layer_idx}.");
+            let (_, attn_norm) = file.read_tensor_f32(&(prefix.clone() + "attn_norm.weight"))?;
+            let (_, attn_q_norm) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_q_norm.weight"))?;
+            let (_, attn_k_norm) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_k_norm.weight"))?;
+            let (_, attn_q) = file.read_tensor_f32(&(prefix.clone() + "attn_q.weight"))?;
+            let (_, attn_k) = file.read_tensor_f32(&(prefix.clone() + "attn_k.weight"))?;
+            let (_, attn_v) = file.read_tensor_f32(&(prefix.clone() + "attn_v.weight"))?;
+            let attn_qkv = concat_linear_weights_cpu(&[&attn_q, &attn_k, &attn_v]);
+            let (_, attn_output) =
+                file.read_tensor_f32(&(prefix.clone() + "attn_output.weight"))?;
+            let (_, ffn_norm) = file.read_tensor_f32(&(prefix.clone() + "ffn_norm.weight"))?;
+            let (_, ffn_gate) = file.read_tensor_f32(&(prefix.clone() + "ffn_gate.weight"))?;
+            let (_, ffn_up) = file.read_tensor_f32(&(prefix.clone() + "ffn_up.weight"))?;
+            let ffn_gate_up = concat_linear_weights_cpu(&[&ffn_gate, &ffn_up]);
+            let (_, ffn_down) = file.read_tensor_f32(&(prefix.clone() + "ffn_down.weight"))?;
+            layers.push(CodePredCpuLayerWeights {
+                attn_norm,
+                attn_q_norm,
+                attn_k_norm,
+                attn_q,
+                attn_k,
+                attn_v,
+                attn_qkv,
+                attn_output,
+                ffn_norm,
+                ffn_gate,
+                ffn_up,
+                ffn_gate_up,
+                ffn_down,
+            });
+        }
+
+        Ok(Self {
+            input_proj_weight,
+            input_proj_bias,
+            embeddings,
+            projected_embeddings,
             output_norm,
             heads,
             layers,
@@ -4523,6 +5853,367 @@ fn try_read_embedding_matrix_f32(
     (data.len() == hidden * vocab).then_some(data)
 }
 
+fn try_read_code_pred_projected_embedding_tables_cpu(
+    file: &GgufFile,
+    cfg: &TtsTransformerConfig,
+    per_codebook: usize,
+) -> Option<Vec<Vec<f32>>> {
+    let code_pred_hidden_size = cfg.code_pred_hidden_size as usize;
+    let vocab = cfg.code_pred_vocab_size as usize;
+    let expected_len = vocab.checked_mul(code_pred_hidden_size)?;
+    let mut tables = Vec::with_capacity(per_codebook);
+    for cb_idx in 0..per_codebook {
+        let name = format!("code_pred.codec_embd_projected.{cb_idx}.weight");
+        let (_, data) = file.read_tensor_f32(&name).ok()?;
+        if data.len() != expected_len {
+            return None;
+        }
+        tables.push(data);
+    }
+    Some(tables)
+}
+
+fn concat_linear_weights_cpu(weights: &[&[f32]]) -> Vec<f32> {
+    let total_len = weights.iter().map(|weight| weight.len()).sum();
+    let mut out = Vec::with_capacity(total_len);
+    for weight in weights {
+        out.extend_from_slice(weight);
+    }
+    out
+}
+
+fn linear_cpu(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), in_features);
+    debug_assert_eq!(out.len(), out_features);
+    for row in 0..out_features {
+        let weights = &weight[row * in_features..(row + 1) * in_features];
+        let sum = bias[row] + dot_product_cpu(input, weights);
+        out[row] = sum;
+    }
+}
+
+#[inline]
+fn dot_product_cpu(input: &[f32], weights: &[f32]) -> f32 {
+    debug_assert_eq!(input.len(), weights.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return unsafe { dot_product_avx2_fma(input, weights) };
+        }
+    }
+    dot_product_scalar(input, weights)
+}
+
+#[inline]
+fn dot_product_scalar(input: &[f32], weights: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for idx in 0..input.len() {
+        sum += input[idx] * weights[idx];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_avx2_fma(input: &[f32], weights: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut idx = 0usize;
+    let len = input.len();
+    while idx + 16 <= len {
+        let x0 = _mm256_loadu_ps(input.as_ptr().add(idx));
+        let w0 = _mm256_loadu_ps(weights.as_ptr().add(idx));
+        let x1 = _mm256_loadu_ps(input.as_ptr().add(idx + 8));
+        let w1 = _mm256_loadu_ps(weights.as_ptr().add(idx + 8));
+        acc0 = _mm256_fmadd_ps(x0, w0, acc0);
+        acc1 = _mm256_fmadd_ps(x1, w1, acc1);
+        idx += 16;
+    }
+    let acc = _mm256_add_ps(acc0, acc1);
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    while idx < len {
+        sum += *input.get_unchecked(idx) * *weights.get_unchecked(idx);
+        idx += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_avx2_fma(input: &[f32], weights: &[f32]) -> f32 {
+    use std::arch::x86::*;
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut idx = 0usize;
+    let len = input.len();
+    while idx + 16 <= len {
+        let x0 = _mm256_loadu_ps(input.as_ptr().add(idx));
+        let w0 = _mm256_loadu_ps(weights.as_ptr().add(idx));
+        let x1 = _mm256_loadu_ps(input.as_ptr().add(idx + 8));
+        let w1 = _mm256_loadu_ps(weights.as_ptr().add(idx + 8));
+        acc0 = _mm256_fmadd_ps(x0, w0, acc0);
+        acc1 = _mm256_fmadd_ps(x1, w1, acc1);
+        idx += 16;
+    }
+    let acc = _mm256_add_ps(acc0, acc1);
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    while idx < len {
+        sum += *input.get_unchecked(idx) * *weights.get_unchecked(idx);
+        idx += 1;
+    }
+    sum
+}
+
+fn linear_no_bias_cpu(
+    input: &[f32],
+    weight: &[f32],
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+    thread_count: usize,
+) {
+    debug_assert_eq!(input.len(), in_features);
+    debug_assert_eq!(out.len(), out_features);
+    let workers = thread_count.min(out_features).max(1);
+    if workers == 1 || out_features < 64 {
+        for row in 0..out_features {
+            let weights = &weight[row * in_features..(row + 1) * in_features];
+            out[row] = dot_product_cpu(input, weights);
+        }
+        return;
+    }
+    out.par_iter_mut().enumerate().for_each(|(row, out_cell)| {
+        let weights = &weight[row * in_features..(row + 1) * in_features];
+        *out_cell = dot_product_cpu(input, weights);
+    });
+}
+
+fn matmul_rows_cpu(
+    input: &[f32],
+    weight: &[f32],
+    n_rows: usize,
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+    thread_count: usize,
+) {
+    debug_assert_eq!(input.len(), n_rows * in_features);
+    debug_assert_eq!(out.len(), n_rows * out_features);
+    for row_idx in 0..n_rows {
+        let input_row = &input[row_idx * in_features..(row_idx + 1) * in_features];
+        let out_row = &mut out[row_idx * out_features..(row_idx + 1) * out_features];
+        linear_no_bias_cpu(
+            input_row,
+            weight,
+            in_features,
+            out_features,
+            out_row,
+            thread_count,
+        );
+    }
+}
+
+fn rms_norm_rows_cpu(
+    input: &[f32],
+    weight: &[f32],
+    n_rows: usize,
+    width: usize,
+    eps: f32,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), n_rows * width);
+    debug_assert_eq!(out.len(), input.len());
+    for row_idx in 0..n_rows {
+        let row = &input[row_idx * width..(row_idx + 1) * width];
+        let out_row = &mut out[row_idx * width..(row_idx + 1) * width];
+        let mean_square = row.iter().map(|v| v * v).sum::<f32>() / width as f32;
+        let scale = (mean_square + eps).sqrt().recip();
+        for idx in 0..width {
+            out_row[idx] = row[idx] * scale * weight[idx];
+        }
+    }
+}
+
+fn rms_norm_one_cpu(input: &[f32], weight: &[f32], width: usize, eps: f32, out: &mut [f32]) {
+    debug_assert_eq!(input.len(), width);
+    debug_assert_eq!(out.len(), width);
+    let mean_square = input.iter().map(|v| v * v).sum::<f32>() / width as f32;
+    let scale = (mean_square + eps).sqrt().recip();
+    for idx in 0..width {
+        out[idx] = input[idx] * scale * weight[idx];
+    }
+}
+
+fn rms_norm_rows_in_place_cpu(data: &mut [f32], weight: &[f32], width: usize, eps: f32) {
+    let n_rows = data.len() / width;
+    for row_idx in 0..n_rows {
+        let row = &mut data[row_idx * width..(row_idx + 1) * width];
+        let mean_square = row.iter().map(|v| v * v).sum::<f32>() / width as f32;
+        let scale = (mean_square + eps).sqrt().recip();
+        for idx in 0..width {
+            row[idx] *= scale * weight[idx];
+        }
+    }
+}
+
+fn apply_rope_single_in_place_cpu(
+    data: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+) {
+    let half = head_dim / 2;
+    for pair_idx in 0..half {
+        let inv_freq = theta.powf(-2.0 * pair_idx as f32 / head_dim as f32);
+        let angle = pos as f32 * inv_freq;
+        let cos = angle.cos();
+        let sin = angle.sin();
+        for head in 0..n_heads {
+            let base = head * head_dim;
+            let x1 = data[base + pair_idx];
+            let x2 = data[base + half + pair_idx];
+            data[base + pair_idx] = x1 * cos - x2 * sin;
+            data[base + half + pair_idx] = x2 * cos + x1 * sin;
+        }
+    }
+}
+
+fn apply_rope_in_place_cpu(
+    data: &mut [f32],
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+) {
+    let half = head_dim / 2;
+    for pos in 0..n_tokens {
+        for pair_idx in 0..half {
+            let inv_freq = theta.powf(-2.0 * pair_idx as f32 / head_dim as f32);
+            let angle = pos as f32 * inv_freq;
+            let cos = angle.cos();
+            let sin = angle.sin();
+            for head in 0..n_heads {
+                let base = (pos * n_heads + head) * head_dim;
+                let x1 = data[base + pair_idx];
+                let x2 = data[base + half + pair_idx];
+                data[base + pair_idx] = x1 * cos - x2 * sin;
+                data[base + half + pair_idx] = x2 * cos + x1 * sin;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_single_cpu(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    kv_group: usize,
+    head_dim: usize,
+    _n_ctx: usize,
+    out: &mut [f32],
+) {
+    let scale = (head_dim as f32).sqrt().recip();
+    out.fill(0.0);
+    let mut scores = vec![0.0f32; n_tokens];
+    for head in 0..n_heads {
+        let kv_head = head / kv_group;
+        let q_base = head * head_dim;
+        for k_pos in 0..n_tokens {
+            let k_base = (k_pos * n_kv_heads + kv_head) * head_dim;
+            let mut dot = 0.0f32;
+            for dim in 0..head_dim {
+                dot += q[q_base + dim] * k_cache[k_base + dim];
+            }
+            scores[k_pos] = dot * scale;
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0f32;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            denom += *score;
+        }
+        let out_base = head * head_dim;
+        for k_pos in 0..n_tokens {
+            let prob = scores[k_pos] / denom;
+            let v_base = (k_pos * n_kv_heads + kv_head) * head_dim;
+            for dim in 0..head_dim {
+                out[out_base + dim] += prob * v_cache[v_base + dim];
+            }
+        }
+    }
+}
+
+fn attention_cpu(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    let kv_group = n_heads / n_kv_heads;
+    let scale = (head_dim as f32).sqrt().recip();
+    out.fill(0.0);
+    let mut scores = vec![0.0f32; n_tokens];
+    for q_pos in 0..n_tokens {
+        for head in 0..n_heads {
+            let kv_head = head / kv_group;
+            for k_pos in 0..=q_pos {
+                let q_base = (q_pos * n_heads + head) * head_dim;
+                let k_base = (k_pos * n_kv_heads + kv_head) * head_dim;
+                let mut dot = 0.0f32;
+                for dim in 0..head_dim {
+                    dot += q[q_base + dim] * k[k_base + dim];
+                }
+                scores[k_pos] = dot * scale;
+            }
+            let max_score = scores[..=q_pos]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for score in &mut scores[..=q_pos] {
+                *score = (*score - max_score).exp();
+                denom += *score;
+            }
+            let out_base = (q_pos * n_heads + head) * head_dim;
+            for k_pos in 0..=q_pos {
+                let prob = scores[k_pos] / denom;
+                let v_base = (k_pos * n_kv_heads + kv_head) * head_dim;
+                for dim in 0..head_dim {
+                    out[out_base + dim] += prob * v[v_base + dim];
+                }
+            }
+        }
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
 fn load_tensor_into_context(
     file: &GgufFile,
     ctx: *mut sys::ggml_context,
@@ -4535,6 +6226,70 @@ fn load_tensor_into_context(
     }
     let tensor = unsafe { sys::ggml_new_tensor(ctx, info.ty, info.dims.len() as i32, ne.as_ptr()) };
     NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
+}
+
+fn existing_tensor_name<'a>(
+    file: &GgufFile,
+    names: &'a [&'a str],
+) -> Result<&'a str, Qwen3TtsError> {
+    for &name in names {
+        match file.tensor_info(name) {
+            Ok(_) => return Ok(name),
+            Err(Qwen3TtsError::MissingTensor(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Qwen3TtsError::MissingTensor(names[0].into()))
+}
+
+fn load_talker_tensor_into_context(
+    file: &GgufFile,
+    ctx: *mut sys::ggml_context,
+    name: &str,
+    force_f32: bool,
+) -> Result<NonNull<sys::ggml_tensor>, Qwen3TtsError> {
+    if !force_f32 {
+        return load_tensor_into_context(file, ctx, name);
+    }
+    let info = file.tensor_info(name)?;
+    let mut ne = [1i64; 4];
+    for (idx, dim) in info.dims.iter().copied().enumerate() {
+        ne[idx] = dim as i64;
+    }
+    let tensor = unsafe {
+        sys::ggml_new_tensor(
+            ctx,
+            sys::ggml_type_GGML_TYPE_F32,
+            info.dims.len() as i32,
+            ne.as_ptr(),
+        )
+    };
+    NonNull::new(tensor).ok_or_else(|| Qwen3TtsError::InvalidTensor(name.into()))
+}
+
+fn upload_talker_tensor(
+    file: &GgufFile,
+    name: &str,
+    tensor: NonNull<sys::ggml_tensor>,
+    force_f32: bool,
+) -> Result<(), Qwen3TtsError> {
+    if force_f32 {
+        let (_, data) = file.read_tensor_f32(name)?;
+        unsafe {
+            sys::ggml_backend_tensor_set(
+                tensor.as_ptr(),
+                data.as_ptr().cast(),
+                0,
+                std::mem::size_of_val(data.as_slice()),
+            );
+        }
+    } else {
+        let (_, raw) = file.read_tensor_bytes(name)?;
+        unsafe {
+            sys::ggml_backend_tensor_set(tensor.as_ptr(), raw.as_ptr().cast(), 0, raw.len());
+        }
+    }
+    Ok(())
 }
 
 fn load_tensor_f32_into_context(
@@ -4565,6 +6320,19 @@ fn load_tensor_f32_into_context(
         )
     };
     Ok(NonNull::new(tensor))
+}
+
+fn load_optional_talker_tensor_into_context(
+    file: &GgufFile,
+    ctx: *mut sys::ggml_context,
+    name: &str,
+    force_f32: bool,
+) -> Result<Option<NonNull<sys::ggml_tensor>>, Qwen3TtsError> {
+    match file.tensor_info(name) {
+        Ok(_) => load_talker_tensor_into_context(file, ctx, name, force_f32).map(Some),
+        Err(Qwen3TtsError::MissingTensor(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn load_optional_tensor_into_context(
@@ -4620,12 +6388,14 @@ fn select_token(
     }
 
     if temperature <= 0.0 {
-        let (best_idx, best_value) = adjusted
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to select token".into()))?;
+        let mut best_idx = 0usize;
+        let mut best_value = adjusted[0];
+        for (idx, &value) in adjusted.iter().enumerate().skip(1) {
+            if value.total_cmp(&best_value).is_gt() {
+                best_idx = idx;
+                best_value = value;
+            }
+        }
         if !best_value.is_finite() {
             return Err(Qwen3TtsError::InvalidInput(
                 "all candidate logits were filtered out".into(),
@@ -4746,9 +6516,35 @@ fn select_token(
         .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to sample token".into()))
 }
 
+fn select_token_stable(logits: &[f32], epsilon: f32) -> Result<i32, Qwen3TtsError> {
+    if logits.is_empty() {
+        return Err(Qwen3TtsError::InvalidInput(
+            "logits must not be empty".into(),
+        ));
+    }
+    let best = logits
+        .iter()
+        .copied()
+        .filter(|logit| logit.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !best.is_finite() {
+        return Err(Qwen3TtsError::InvalidInput(
+            "all candidate logits were filtered out".into(),
+        ));
+    }
+    logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, logit)| logit.is_finite() && best - *logit <= epsilon)
+        .map(|(idx, _)| idx as i32)
+        .min()
+        .ok_or_else(|| Qwen3TtsError::InvalidInput("failed to select stable token".into()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::select_token;
+    use super::{select_token, select_token_stable};
 
     #[test]
     fn select_token_prefers_best_logit() {
@@ -4759,6 +6555,18 @@ mod tests {
     #[test]
     fn select_token_applies_repetition_penalty() {
         let token = select_token(&[5.0, 4.0], 2.0, 0.0, 0, 1.0, &[0]).unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn select_token_prefers_first_max_when_greedy_tied() {
+        let token = select_token(&[1.0, 2.0, 2.0, 0.5], 1.0, 0.0, 0, 1.0, &[]).unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn select_token_stable_prefers_lowest_near_tie() {
+        let token = select_token_stable(&[0.0, 1.0, 1.005, 0.5], 0.01).unwrap();
         assert_eq!(token, 1);
     }
 }

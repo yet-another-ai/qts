@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use ort::ep::ExecutionProvider;
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
@@ -20,18 +20,6 @@ use crate::Qwen3TtsError;
 
 fn ort_err(err: impl std::fmt::Display) -> Qwen3TtsError {
     Qwen3TtsError::Ort(err.to_string())
-}
-
-fn ensure_ort_init() -> Result<(), Qwen3TtsError> {
-    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    ORT_INIT
-        .get_or_init(|| {
-            let _ = ort::init().commit();
-            Ok(())
-        })
-        .as_ref()
-        .map_err(|err| Qwen3TtsError::Ort(err.clone()))?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +78,18 @@ pub enum VocoderExecutionProvider {
 }
 
 impl VocoderExecutionProvider {
+    #[must_use]
+    fn is_directml(self) -> bool {
+        #[cfg(feature = "directml")]
+        {
+            self == Self::DirectMl
+        }
+        #[cfg(not(feature = "directml"))]
+        {
+            false
+        }
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -433,11 +433,6 @@ fn default_auto_execution_provider_order() -> Vec<VocoderExecutionProvider> {
         order.push(VocoderExecutionProvider::TensorRt);
     }
 
-    #[cfg(all(target_os = "windows", feature = "directml"))]
-    {
-        order.push(VocoderExecutionProvider::DirectMl);
-    }
-
     order.push(VocoderExecutionProvider::Cpu);
     order
 }
@@ -529,11 +524,17 @@ struct VocoderSessionState {
     templates: HashMap<usize, CachedVocoderTemplate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VocoderSessionCacheKey {
+    thread_count: usize,
+    n_frames: Option<usize>,
+}
+
 pub struct Vocoder {
     config: VocoderConfig,
     model_path: PathBuf,
     execution_provider: VocoderExecutionProvider,
-    sessions: Mutex<HashMap<usize, VocoderSessionState>>,
+    sessions: Mutex<HashMap<VocoderSessionCacheKey, VocoderSessionState>>,
 }
 
 impl Vocoder {
@@ -543,11 +544,11 @@ impl Vocoder {
             return Err(Qwen3TtsError::ModelFile(path));
         }
 
-        ensure_ort_init()?;
-        let (default_session, execution_provider) = Self::build_session(&path, 1)?;
+        crate::ensure_ort_init()?;
+        let (default_session, execution_provider) = Self::build_session(&path, 1, None)?;
         let mut sessions = HashMap::new();
         sessions.insert(
-            1,
+            Self::session_cache_key(execution_provider, 1, None),
             VocoderSessionState {
                 session: default_session,
                 templates: HashMap::new(),
@@ -623,13 +624,18 @@ impl Vocoder {
             )));
         }
 
-        let key = thread_count.max(1);
+        let key = Self::session_cache_key(
+            self.execution_provider,
+            thread_count,
+            Some(template.n_frames),
+        );
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| Qwen3TtsError::InvalidInput("failed to lock ORT session cache".into()))?;
         if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(key) {
-            let (session, actual_ep) = Self::build_session(&self.model_path, key)?;
+            let (session, actual_ep) =
+                Self::build_session(&self.model_path, key.thread_count, key.n_frames)?;
             if actual_ep != self.execution_provider {
                 return Err(Qwen3TtsError::InvalidInput(format!(
                     "ORT execution provider mismatch across sessions: expected {}, got {}",
@@ -646,6 +652,14 @@ impl Vocoder {
         let state = sessions
             .get_mut(&key)
             .ok_or_else(|| Qwen3TtsError::InvalidInput("missing ORT session".into()))?;
+        if self.execution_provider.is_directml() {
+            return Self::decode_with_session_run(
+                &mut state.session,
+                codes,
+                template.n_frames,
+                n_codebooks,
+            );
+        }
         if !state.templates.contains_key(&template.n_frames) {
             let cached = Self::create_cached_template(
                 &state.session,
@@ -679,6 +693,33 @@ impl Vocoder {
             return Err(Qwen3TtsError::InvalidOnnx(self.model_path.clone()));
         }
 
+        let (_audio_shape, audio_values) =
+            outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
+        let (_length_shape, audio_lengths) =
+            outputs[1].try_extract_tensor::<i64>().map_err(ort_err)?;
+        let sample_count = audio_lengths
+            .first()
+            .copied()
+            .unwrap_or(audio_values.len() as i64)
+            .clamp(0, audio_values.len() as i64) as usize;
+        Ok(audio_values[..sample_count].to_vec())
+    }
+
+    fn decode_with_session_run(
+        session: &mut Session,
+        codes: &[i32],
+        n_frames: usize,
+        n_codebooks: usize,
+    ) -> Result<Vec<f32>, Qwen3TtsError> {
+        let input_values = codes.iter().copied().map(i64::from).collect::<Vec<_>>();
+        let input = Tensor::<i64>::from_array(([1usize, n_frames, n_codebooks], input_values))
+            .map_err(ort_err)?;
+        let outputs = session.run(ort::inputs![input]).map_err(ort_err)?;
+        if outputs.len() < 2 {
+            return Err(Qwen3TtsError::InvalidInput(
+                "vocoder did not return audio outputs".into(),
+            ));
+        }
         let (_audio_shape, audio_values) =
             outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
         let (_length_shape, audio_lengths) =
@@ -742,19 +783,27 @@ impl Vocoder {
     fn build_session(
         path: &Path,
         thread_count: usize,
+        n_frames: Option<usize>,
     ) -> Result<(Session, VocoderExecutionProvider), Qwen3TtsError> {
-        ensure_ort_init()?;
+        crate::ensure_ort_init()?;
 
         match parse_requested_execution_provider()? {
             RequestedExecutionProvider::Explicit(provider) => {
-                let session = Self::build_session_for_provider(path, thread_count, provider, true)?;
+                let session =
+                    Self::build_session_for_provider(path, thread_count, n_frames, provider, true)?;
                 Ok((session, provider))
             }
             RequestedExecutionProvider::Auto => {
                 let order = parse_auto_execution_provider_order()?;
                 let mut last_error = None;
                 for provider in order {
-                    match Self::build_session_for_provider(path, thread_count, provider, false) {
+                    match Self::build_session_for_provider(
+                        path,
+                        thread_count,
+                        n_frames,
+                        provider,
+                        false,
+                    ) {
                         Ok(session) => return Ok((session, provider)),
                         Err(err) => last_error = Some(err),
                     }
@@ -772,18 +821,56 @@ impl Vocoder {
     fn build_session_for_provider(
         path: &Path,
         thread_count: usize,
+        n_frames: Option<usize>,
         provider: VocoderExecutionProvider,
         required: bool,
     ) -> Result<Session, Qwen3TtsError> {
+        crate::trace_stage("vocoder: session builder");
         let mut builder = Session::builder().map_err(ort_err)?;
+        let optimization_level = if provider.is_directml() {
+            GraphOptimizationLevel::Disable
+        } else {
+            GraphOptimizationLevel::Level3
+        };
+        crate::trace_stage("vocoder: optimization level");
         builder = builder
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .with_optimization_level(optimization_level)
             .map_err(ort_err)?;
         if thread_count > 0 {
+            crate::trace_stage("vocoder: intra threads");
             builder = builder.with_intra_threads(thread_count).map_err(ort_err)?;
         }
+        if provider.is_directml() {
+            builder = builder
+                .with_memory_pattern(false)
+                .and_then(|builder| builder.with_parallel_execution(false))
+                .map_err(ort_err)?;
+            if let Some(n_frames) = n_frames {
+                builder = builder
+                    .with_dimension_override("batch", 1)
+                    .and_then(|builder| builder.with_dimension_override("frames", n_frames as i64))
+                    .map_err(ort_err)?;
+            }
+        }
+        crate::trace_stage("vocoder: register ep");
         Self::register_execution_provider(&mut builder, provider, required)?;
+        crate::trace_stage("vocoder: commit session");
         builder.commit_from_file(path).map_err(ort_err)
+    }
+
+    fn session_cache_key(
+        provider: VocoderExecutionProvider,
+        thread_count: usize,
+        n_frames: Option<usize>,
+    ) -> VocoderSessionCacheKey {
+        VocoderSessionCacheKey {
+            thread_count: thread_count.max(1),
+            n_frames: if provider.is_directml() {
+                n_frames
+            } else {
+                None
+            },
+        }
     }
 
     #[allow(unused_variables)]

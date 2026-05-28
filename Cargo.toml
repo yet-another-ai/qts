@@ -20,6 +20,7 @@ qts_ggml_sys = { path = "crates/qts_ggml_sys", version = "0.2.0" }
 qts_ggml = { path = "crates/qts_ggml", version = "0.2.0" }
 thiserror = "2"
 rand = "0.10"
+rayon = "1.11"
 anyhow = "1.0.102"
 cpal = "0.17"
 crossterm = "0.29"
@@ -34,8 +35,13 @@ cmake = "0.1"
 rustfft = "6.4.1"
 prost = "0.14"
 sha2 = "0.10"
-ort = "2.0.0-rc.9"
+serde = "1.0"
+serde_json = "1.0"
+axum = "0.8"
+tokio = "1.48"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "download-binaries", "copy-dylibs", "tls-native", "api-24"] }
 windows-sys = "0.61"
+libloading = "0.8"
 
 [profile.release]
 debug = "line-tables-only"

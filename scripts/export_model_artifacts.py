@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import json
 import logging
 import re
@@ -14,6 +15,8 @@ from typing import Any, Iterator
 import numpy as np
 import onnx
 import torch
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.mimi import modeling_mimi
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from tqdm import tqdm
@@ -74,6 +77,8 @@ class Qwen3MainGgufExporter:
         "talker.text_projection.linear_fc2.weight": "talker.text_proj.fc2.weight",
         "talker.text_projection.linear_fc2.bias": "talker.text_proj.fc2.bias",
         "talker.code_predictor.model.norm.weight": "code_pred.output_norm.weight",
+        "talker.code_predictor.small_to_mtp_projection.weight": "code_pred.input_proj.weight",
+        "talker.code_predictor.small_to_mtp_projection.bias": "code_pred.input_proj.bias",
     }
 
     TALKER_LAYER_PATTERNS = [
@@ -141,13 +146,38 @@ class Qwen3MainGgufExporter:
         self.rope_theta = talker_config.get("rope_theta", 1_000_000)
         self.mrope_section = talker_config.get("rope_scaling", {}).get("mrope_section", [24, 20, 20])
         self.code_predictor_num_layers = code_predictor_config.get("num_hidden_layers", 5)
+        self.code_predictor_hidden_size = code_predictor_config.get("hidden_size", self.hidden_size)
         self.code_predictor_vocab_size = code_predictor_config.get("vocab_size", 2048)
         self.speaker_enc_dim = speaker_encoder_config.get("enc_dim", 1024)
         self.speaker_sample_rate = speaker_encoder_config.get("sample_rate", 24000)
         self.codec_pad_id = talker_config.get("codec_pad_id", 2148)
         self.codec_bos_id = talker_config.get("codec_bos_id", 2149)
         self.codec_eos_id = talker_config.get("codec_eos_token_id", 2150)
-        self.model_name = "Qwen3-TTS-12Hz-0.6B"
+        self.model_size_tag = self._resolve_model_size_tag(self.config.get("tts_model_size"))
+        self.model_type_tag = self._resolve_model_type_tag(self.config.get("tts_model_type"))
+        self.model_name = self._resolve_model_name()
+
+    def _resolve_model_size_tag(self, raw_size: Any) -> str:
+        value = str(raw_size or "").strip().lower()
+        if value in {"1b7", "1.7b", "1_7b"}:
+            return "1.7b"
+        return "0.6b"
+
+    def _resolve_model_type_tag(self, raw_type: Any) -> str:
+        value = str(raw_type or "base").strip().lower()
+        if value == "custom_voice":
+            return "customvoice"
+        if value == "voice_design":
+            return "voicedesign"
+        return "base"
+
+    def _resolve_model_name(self) -> str:
+        suffix = ""
+        if self.model_type_tag == "customvoice":
+            suffix = "-CustomVoice"
+        elif self.model_type_tag == "voicedesign":
+            suffix = "-VoiceDesign"
+        return f"Qwen3-TTS-12Hz-{self.model_size_tag.upper()}{suffix}"
 
     def _map_tensor_name(self, hf_name: str) -> str | None:
         if hf_name in self.TENSOR_MAP:
@@ -195,6 +225,10 @@ class Qwen3MainGgufExporter:
         data = tensor.float().numpy() if tensor.dtype == torch.bfloat16 else tensor.numpy()
         if data.ndim <= 1:
             return data.astype(np.float32), gguf.GGMLQuantizationType.F32
+        if tensor_name.startswith("code_pred."):
+            return data.astype(np.float32), gguf.GGMLQuantizationType.F32
+        if self.model_type_tag == "customvoice" and tensor_name.startswith("talker.blk."):
+            return data.astype(np.float32), gguf.GGMLQuantizationType.F32
         if self.output_type == "f16":
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         if not self._should_quantize(tensor_name):
@@ -211,6 +245,38 @@ class Qwen3MainGgufExporter:
                 exc,
             )
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+    @staticmethod
+    def _codec_embedding_index(hf_name: str) -> int | None:
+        match = re.match(
+            r"talker\.code_predictor\.model\.codec_embedding\.(\d+)\.weight",
+            hf_name,
+        )
+        return int(match.group(1)) if match else None
+
+    def _add_projected_code_pred_embedding(
+        self,
+        writer: gguf.GGUFWriter,
+        cb_idx: int,
+        embedding: torch.Tensor,
+        input_proj_weight: torch.Tensor | None,
+        input_proj_bias: torch.Tensor | None,
+    ) -> bool:
+        if input_proj_weight is None or input_proj_bias is None:
+            return False
+        with torch.no_grad():
+            projected = torch.nn.functional.linear(
+                embedding.float(),
+                input_proj_weight.float(),
+                input_proj_bias.float(),
+            )
+        data = projected.cpu().numpy().astype(np.float32)
+        writer.add_tensor(
+            f"code_pred.codec_embd_projected.{cb_idx}.weight",
+            data,
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        return True
 
     def _load_tokenizer(self) -> tuple[list[str], list[int], list[str]]:
         vocab_path = self.input_dir / "vocab.json"
@@ -265,6 +331,7 @@ class Qwen3MainGgufExporter:
         writer.add_uint32(f"{arch}.num_code_groups", self.num_code_groups)
         writer.add_array(f"{arch}.rope.mrope_section", self.mrope_section)
         writer.add_uint32(f"{arch}.code_predictor.layer_count", self.code_predictor_num_layers)
+        writer.add_uint32(f"{arch}.code_predictor.hidden_size", self.code_predictor_hidden_size)
         writer.add_uint32(f"{arch}.code_predictor.vocab_size", self.code_predictor_vocab_size)
         writer.add_uint32(f"{arch}.speaker_encoder.embedding_length", self.speaker_enc_dim)
         writer.add_uint32(f"{arch}.speaker_encoder.sample_rate", self.speaker_sample_rate)
@@ -309,20 +376,42 @@ class Qwen3MainGgufExporter:
         self._add_tokenizer(writer)
 
         tensor_count = 0
+        derived_count = 0
         skipped_count = 0
+        code_pred_input_proj_weight: torch.Tensor | None = None
+        code_pred_input_proj_bias: torch.Tensor | None = None
+        pending_code_pred_embeddings: dict[int, torch.Tensor] = {}
         for hf_name, tensor in tqdm(self._get_tensors(), desc="Converting GGUF"):
             ggml_name = self._map_tensor_name(hf_name)
             if ggml_name is None:
                 skipped_count += 1
                 logger.debug("Skipping unmapped tensor: %s", hf_name)
                 continue
+            if hf_name == "talker.code_predictor.small_to_mtp_projection.weight":
+                code_pred_input_proj_weight = tensor
+            elif hf_name == "talker.code_predictor.small_to_mtp_projection.bias":
+                code_pred_input_proj_bias = tensor
             data, dtype = self._convert_dtype(tensor, ggml_name)
             writer.add_tensor(ggml_name, data, raw_dtype=dtype)
             tensor_count += 1
+            cb_idx = self._codec_embedding_index(hf_name)
+            if cb_idx is not None:
+                pending_code_pred_embeddings[cb_idx] = tensor
+
+        for cb_idx, tensor in sorted(pending_code_pred_embeddings.items()):
+            if self._add_projected_code_pred_embedding(
+                writer,
+                cb_idx,
+                tensor,
+                code_pred_input_proj_weight,
+                code_pred_input_proj_bias,
+            ):
+                derived_count += 1
 
         logger.info(
-            "Prepared GGUF tensors: converted=%s skipped=%s output=%s",
+            "Prepared GGUF tensors: converted=%s derived=%s skipped=%s output=%s",
             tensor_count,
+            derived_count,
             skipped_count,
             self.output_path,
         )
@@ -346,6 +435,102 @@ class VocoderOnnxWrapper(torch.nn.Module):
         return audio_values, audio_lengths
 
 
+class TokenizerEncoderOnnxWrapper(torch.nn.Module):
+    def __init__(self, tokenizer_model: torch.nn.Module):
+        super().__init__()
+        self.model = tokenizer_model
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        encoded = self.model.encoder.encode(
+            input_values=input_values.unsqueeze(1),
+            return_dict=True,
+        )
+        codes = encoded.audio_codes
+        codes = codes[:, : self.model.encoder_valid_num_quantizers]
+        return codes.transpose(1, 2).to(dtype=torch.long)
+
+
+def patch_mimi_encoder_for_onnx_export(transformer: torch.nn.Module) -> None:
+    """Avoid exporter-hostile masking/vmap code while preserving causal masking."""
+
+    def simple_forward(
+        self: torch.nn.Module,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+    ) -> Any:
+        del attention_mask, past_key_values, use_cache
+        assert hidden_states is not None
+        batch_size = hidden_states.shape[0]
+        seq_len = hidden_states.shape[1]
+        if cache_position is None:
+            cache_position = torch.arange(seq_len, device=hidden_states.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        q = torch.arange(seq_len, device=hidden_states.device).view(seq_len, 1)
+        k = torch.arange(seq_len, device=hidden_states.device).view(1, seq_len)
+        allowed = k <= q
+        window = int(getattr(self.config, "sliding_window", 0) or 0)
+        if window > 0:
+            allowed = allowed & (k >= (q - window + 1))
+        mask = torch.zeros((seq_len, seq_len), dtype=hidden_states.dtype, device=hidden_states.device)
+        mask = mask.masked_fill(~allowed, torch.finfo(hidden_states.dtype).min)
+        causal_mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        for layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=bool(output_attentions),
+                use_cache=False,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, None, all_hidden_states, all_self_attns] if v is not None
+            )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    transformer.forward = simple_forward.__get__(transformer, type(transformer))
+
+
+def patch_mimi_vq_for_onnx_export() -> None:
+    """Replace torch.cdist with ONNX-friendly squared-distance matmul."""
+
+    def quantize(self: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden = hidden_states.float()
+        embed = self.embed.float()
+        hidden_norm = (hidden * hidden).sum(dim=-1, keepdim=True)
+        embed_norm = (embed * embed).sum(dim=-1).unsqueeze(0)
+        dists = hidden_norm - 2.0 * torch.matmul(hidden, embed.transpose(0, 1)) + embed_norm
+        return dists.argmin(dim=-1)
+
+    modeling_mimi.MimiEuclideanCodebook.quantize = quantize
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Hugging Face repo id or local model directory.")
@@ -362,6 +547,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--main-out", default=None, help="Override the main GGUF output path.")
     parser.add_argument("--vocoder-out", default=None, help="Override the vocoder ONNX output path.")
     parser.add_argument(
+        "--tokenizer-encoder-out",
+        default=None,
+        help="Experimental: export the speech-tokenizer encoder ONNX to this path.",
+    )
+    parser.add_argument(
+        "--export-tokenizer-encoder",
+        action="store_true",
+        help="Attempt experimental speech-tokenizer encoder ONNX export.",
+    )
+    parser.add_argument(
         "--vocoder-dtype",
         default="float32",
         help="dtype used when loading the PyTorch vocoder before ONNX export.",
@@ -371,6 +566,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=17,
         help="ONNX opset version for vocoder export.",
+    )
+    parser.add_argument(
+        "--tokenizer-encoder-opset",
+        type=int,
+        default=17,
+        help="ONNX opset version for speech-tokenizer encoder export.",
     )
     parser.add_argument(
         "--local-files-only",
@@ -428,11 +629,28 @@ def resolve_model_dir(model_name_or_path: str, local_files_only: bool) -> Path:
 
 
 def default_main_output(out_dir: Path, main_type: str) -> Path:
+    config_path = out_dir / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            size = str(config.get("tts_model_size", "")).strip().lower()
+            model_type = str(config.get("tts_model_type", "base")).strip().lower()
+            size_tag = "1.7b" if size in {"1b7", "1.7b", "1_7b"} else "0.6b"
+            if model_type == "custom_voice":
+                return out_dir / f"qwen3-tts-{size_tag}-customvoice-{main_type}.gguf"
+            if model_type == "voice_design":
+                return out_dir / f"qwen3-tts-{size_tag}-voicedesign-{main_type}.gguf"
+        except Exception:
+            pass
     return out_dir / f"qwen3-tts-0.6b-{main_type}.gguf"
 
 
 def default_vocoder_output(out_dir: Path) -> Path:
     return out_dir / "qwen3-tts-vocoder.onnx"
+
+
+def default_tokenizer_encoder_output(out_dir: Path) -> Path:
+    return out_dir / "qwen3-tts-tokenizer-encoder.onnx"
 
 
 def add_onnx_metadata(
@@ -564,6 +782,74 @@ def export_vocoder_onnx(
     return output_path
 
 
+def export_tokenizer_encoder_onnx(
+    *,
+    speech_tokenizer_dir: Path,
+    output_path: Path,
+    source_model: str,
+    dtype_name: str,
+    opset: int,
+) -> Path:
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        str(speech_tokenizer_dir),
+        device_map="cpu",
+        dtype=resolve_dtype(dtype_name),
+        attn_implementation="eager",
+    )
+    model = tokenizer.model
+    model.eval()
+    if model.get_model_type() != "qwen3_tts_tokenizer_12hz":
+        raise SystemExit(
+            f"Only the 12Hz speech tokenizer encoder is supported for ONNX export, got {model.get_model_type()}"
+        )
+    patch_mimi_encoder_for_onnx_export(model.encoder.encoder_transformer)
+    patch_mimi_vq_for_onnx_export()
+
+    input_sample_rate = int(model.get_input_sample_rate())
+    num_quantizers = int(model.config.encoder_valid_num_quantizers)
+    wrapper = TokenizerEncoderOnnxWrapper(model).cpu().eval()
+    dummy_samples = torch.zeros((1, input_sample_rate), dtype=torch.float32)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (dummy_samples,),
+        str(output_path),
+        export_params=True,
+        opset_version=opset,
+        dynamo=False,
+        do_constant_folding=True,
+        input_names=["input_values"],
+        output_names=["audio_codes"],
+        dynamic_axes={
+            "input_values": {0: "batch", 1: "samples"},
+            "audio_codes": {0: "batch", 1: "frames"},
+        },
+    )
+    model_proto = onnx.load(str(output_path), load_external_data=True)
+    metadata = {
+        "source_model": source_model,
+        "speech_tokenizer_dir": str(speech_tokenizer_dir),
+        "input_sample_rate_hz": str(input_sample_rate),
+        "num_quantizers": str(num_quantizers),
+        "input_layout": "batch,samples",
+        "output_layout": "batch,frames,quantizers",
+    }
+    for key, value in metadata.items():
+        prop = model_proto.metadata_props.add()
+        prop.key = key
+        prop.value = value
+    onnx.save_model(model_proto, str(output_path), save_as_external_data=False)
+    cleanup_stale_onnx_external_data(output_path)
+    logger.info(
+        "Exported speech-tokenizer encoder ONNX: path=%s input_sample_rate=%s num_quantizers=%s",
+        output_path,
+        input_sample_rate,
+        num_quantizers,
+    )
+    return output_path
+
+
 def main() -> None:
     configure_stdio()
     args = parse_args()
@@ -573,15 +859,26 @@ def main() -> None:
     model_dir = resolve_model_dir(args.model, local_files_only=args.local_files_only)
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    src_config = (model_dir / "config.json").resolve()
+    dst_config = (out_dir / "config.json").resolve()
+    if src_config != dst_config:
+        shutil.copy2(src_config, dst_config)
 
     if args.main_out and len(main_types) != 1:
         raise SystemExit("--main-out can only be used when exporting exactly one --main-type.")
 
     vocoder_out = Path(args.vocoder_out).expanduser().resolve() if args.vocoder_out else default_vocoder_output(out_dir)
+    tokenizer_encoder_out = (
+        Path(args.tokenizer_encoder_out).expanduser().resolve()
+        if args.tokenizer_encoder_out
+        else default_tokenizer_encoder_output(out_dir)
+    )
 
     logger.info("Resolved model dir: %s", model_dir)
     logger.info("Main GGUF types: %s", ", ".join(main_types))
     logger.info("Vocoder ONNX output: %s", vocoder_out)
+    if args.export_tokenizer_encoder:
+        logger.info("Tokenizer encoder ONNX output: %s", tokenizer_encoder_out)
 
     gguf_outputs: list[Path] = []
     for main_type in main_types:
@@ -615,9 +912,28 @@ def main() -> None:
             opset=args.vocoder_opset,
         )
 
+    tokenizer_encoder_onnx = None
+    if args.export_tokenizer_encoder:
+        if tokenizer_encoder_out.exists():
+            logger.info("Reusing existing tokenizer encoder ONNX: %s", tokenizer_encoder_out)
+            normalize_onnx_to_single_file(tokenizer_encoder_out)
+            tokenizer_encoder_onnx = tokenizer_encoder_out
+        else:
+            tokenizer_encoder_onnx = export_tokenizer_encoder_onnx(
+                speech_tokenizer_dir=model_dir / "speech_tokenizer",
+                output_path=tokenizer_encoder_out,
+                source_model=args.model,
+                dtype_name=args.vocoder_dtype,
+                opset=args.tokenizer_encoder_opset,
+            )
+
+    tokenizer_encoder_part = (
+        f" tokenizer_encoder_onnx={tokenizer_encoder_onnx}" if tokenizer_encoder_onnx else ""
+    )
     print(
         f"exported artifacts: main_ggufs={','.join(str(path) for path in gguf_outputs)} "
-        f"vocoder_onnx={onnx_out} main_types={','.join(main_types)}"
+        f"vocoder_onnx={onnx_out}{tokenizer_encoder_part} "
+        f"main_types={','.join(main_types)}"
     )
 
 
